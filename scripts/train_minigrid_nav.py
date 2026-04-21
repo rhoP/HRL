@@ -1,13 +1,18 @@
 """
-Meta-RL pipeline for the Four-Rooms gridworld with moving goals.
+Meta-RL pipeline for MiniGrid navigation tasks.
 
-State  : (agent_x, agent_y, goal_x, goal_y)  — float32, dim=4
-Actions: 4 discrete directions (0=up 1=right 2=down 3=left)
-Tasks  : A, B, C, D — differ in start/goal room pair
+Four tasks on the FourRooms 19×19 grid; each task fixes the goal in one
+quadrant.  The shared topological bottleneck is the doorway crossing at the
+grid centre — the skeleton should identify it as the critical state.
+
+State  : (agent_x/19, agent_y/19, agent_dir/3, goal_x/19, goal_y/19)
+         — float32, dim=5
+Actions: 3 discrete  (0=left, 1=right, 2=forward; sufficient for navigation)
+Tasks  : NW  NE  SW  SE — goal in each of the four rooms
 
 Run as:
-    python3 scripts/train_four_rooms.py --iterations 5 --landmarks 16
-    python3 scripts/train_four_rooms.py --demo-only --load results/four_rooms/best
+    python3 scripts/train_minigrid_nav.py --iterations 5 --landmarks 64
+    python3 scripts/train_minigrid_nav.py --demo-only --load results/minigrid_nav/best
 """
 
 import argparse
@@ -35,200 +40,173 @@ from utils.viz           import (plot_training_curves, plot_skeleton_topology,
                                   Phase3TrainingCallback, plot_phase3_results,
                                   _P, _c, _save_fig)
 from utils.skeleton      import build_skeleton, refine_skeleton
-
 from models.meta_policy_net import MetaPolicy
 from algos.MetaPolicy import (
-    phase1_build_skeleton, phase2_build_potential,
-    ShapedRewardWrapper,
+    phase1_build_skeleton, phase2_build_potential, ShapedRewardWrapper,
 )
 from algos.meta_policy_gradient import meta_policy_gradient_with_skeleton_shaping
 
-STATE_DIM  = 4
-ACTION_DIM = 4   # discrete; stored as int but dim=4 for one-hot consistency
+try:
+    from minigrid.envs import FourRoomsEnv as _MG_FourRooms
+    from minigrid.core.world_object import Goal as _MG_Goal
+    _MINIGRID_OK = True
+except ImportError:
+    _MINIGRID_OK = False
 
-TASK_CONFIGS = {
-    "A": {"start": (1, 1), "goal": (9, 9)},
-    "B": {"start": (9, 1), "goal": (1, 9)},
-    "C": {"start": (1, 1), "goal": (9, 1)},
-    "D": {"start": (1, 9), "goal": (9, 9)},
+STATE_DIM  = 5
+ACTION_DIM = 3     # left, right, forward
+GRID_SIZE  = 19    # MiniGrid FourRooms default
+
+# Fixed goal cell in each quadrant (clear of walls and doorways)
+TASK_GOALS = {
+    "NW": (4,  4),
+    "NE": (14, 4),
+    "SW": (4,  14),
+    "SE": (14, 14),
 }
-TASK_IDS = {"A": 0, "B": 1, "C": 2, "D": 3}
+TASK_IDS = {"NW": 0, "NE": 1, "SW": 2, "SE": 3}
 
 
-# ── Environment ────────────────────────────────────────────────────────────
+# ── Wrapper ────────────────────────────────────────────────────────────────
 
-class FourRoomsEnv(gym.Env):
+class MiniGridNavWrapper(gym.Wrapper):
     """
-    Four-rooms gridworld (11×11). Horizontal wall at row center=5 with a
-    doorway only at column 5. The agent must cross the wall to reach goals
-    in the opposite half.
-
-    Gymnasium-compatible: reset() → (obs, info), step() → (obs, r, term, trunc, info).
-    info["success"] = 1.0 when the goal is reached.
+    Wraps MiniGrid FourRooms into the pipeline interface:
+      - Compact 5-dim float32 observation
+      - Restricted to 3 actions (left / right / forward)
+      - Dense reward: +10 on goal reached, −0.01/step
+      - info["success"] = 1.0 on termination
     """
 
-    metadata = {"render_modes": []}
-
-    def __init__(self, task_key: str = "A", grid_size: int = 11, noise: float = 0.1,
-                 max_steps: int = 200):
-        super().__init__()
-        self.task_key   = task_key
-        self.grid_size  = grid_size
-        self.center     = grid_size // 2
-        self.noise      = noise
-        self._max_steps  = max_steps
-        self._step_count = 0
-
+    def __init__(self, env: gym.Env, grid_size: int = GRID_SIZE):
+        super().__init__(env)
+        self._gs   = float(grid_size)
+        self._goal = np.zeros(2, dtype=np.float32)
         self.observation_space = spaces.Box(
-            low=0.0, high=float(grid_size - 1),
-            shape=(STATE_DIM,), dtype=np.float32,
+            0.0, 1.0, shape=(STATE_DIM,), dtype=np.float32
         )
-        self.action_space = spaces.Discrete(4)
+        self.action_space = spaces.Discrete(ACTION_DIM)
 
-        self._moves = np.array([(0, -1), (1, 0), (0, 1), (-1, 0)], dtype=np.float32)
-        self._config = TASK_CONFIGS[task_key]
-        self.agent_pos = None
-        self.goal_pos  = None
-
-    def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed)
-        self.agent_pos   = np.array(self._config["start"], dtype=np.float32)
-        self.goal_pos    = np.array(self._config["goal"],  dtype=np.float32)
-        self._step_count = 0
-        return self._obs(), {}
+    def reset(self, **kwargs):
+        _, info = self.env.reset(**kwargs)
+        self._goal = self._locate_goal()
+        return self._obs(), info
 
     def step(self, action):
-        action = int(action)
-        move = self._moves[action].copy()
+        _, r, terminated, truncated, info = self.env.step(int(action))
+        success = bool(terminated) and (r > 0.0)
+        r_out   = 10.0 if success else -0.01
+        info["success"] = float(success)
+        return self._obs(), r_out, terminated, truncated, info
 
-        if np.random.random() < self.noise:
-            move = move[::-1].copy()
+    # ── helpers ───────────────────────────────────────────────────────────
 
-        new_pos = self.agent_pos + move
+    def _obs(self) -> np.ndarray:
+        ax, ay = self.unwrapped.agent_pos
+        ad     = float(self.unwrapped.agent_dir)
+        gx, gy = self._goal
+        return np.array(
+            [ax / self._gs, ay / self._gs, ad / 3.0,
+             gx / self._gs, gy / self._gs],
+            dtype=np.float32,
+        )
 
-        if self._is_valid(self.agent_pos, new_pos):
-            self.agent_pos = new_pos
-
-        self._step_count += 1
-        dist      = np.linalg.norm(self.agent_pos - self.goal_pos)
-        success   = dist < 0.5
-        reward    = 10.0 if success else -0.1
-        truncated = (not success) and self._step_count >= self._max_steps
-
-        return self._obs(), reward, success, truncated, {"success": float(success)}
-
-    def _obs(self):
-        return np.concatenate([self.agent_pos, self.goal_pos]).astype(np.float32)
-
-    def _is_valid(self, old_pos, new_pos):
-        x, y = new_pos
-        gs = self.grid_size
-        c  = self.center
-
-        if x < 0 or x >= gs or y < 0 or y >= gs:
-            return False
-
-        if old_pos[1] < c and y >= c:
-            if int(round(x)) != c:
-                return False
-
-        if old_pos[1] > c and y <= c:
-            if int(round(x)) != c:
-                return False
-
-        return True
+    def _locate_goal(self) -> np.ndarray:
+        grid = self.unwrapped.grid
+        for y in range(self.unwrapped.height):
+            for x in range(self.unwrapped.width):
+                cell = grid.get(x, y)
+                if isinstance(cell, _MG_Goal):
+                    return np.array([float(x), float(y)], dtype=np.float32)
+        return np.zeros(2, dtype=np.float32)
 
 
 # ── Task / Distribution ────────────────────────────────────────────────────
 
-class FourRoomsTask:
+class MiniGridNavTask:
     def __init__(self, task_key: str):
+        if not _MINIGRID_OK:
+            raise RuntimeError("minigrid not installed.  Run: pip install minigrid")
         self.id       = TASK_IDS[task_key]
-        self.env_name = f"FourRooms-{task_key}"
+        self.env_name = f"MiniGridNav-{task_key}"
         self._key     = task_key
+        self._goal    = TASK_GOALS[task_key]
 
-    def create_env(self) -> FourRoomsEnv:
-        return FourRoomsEnv(self._key)
+    def create_env(self, max_steps: int = 500) -> gym.Env:
+        base = _MG_FourRooms(goal_pos=self._goal, max_steps=max_steps)
+        return MiniGridNavWrapper(base)
 
 
-class FourRoomsTaskDistribution:
+class MiniGridNavTaskDistribution:
     def __init__(self, task_keys=None):
-        keys       = task_keys or list(TASK_CONFIGS.keys())
-        self.tasks = [FourRoomsTask(k) for k in keys]
+        keys       = task_keys or list(TASK_GOALS.keys())
+        self.tasks = [MiniGridNavTask(k) for k in keys]
 
-    def sample(self) -> FourRoomsTask:
+    def sample(self) -> MiniGridNavTask:
         return self.tasks[np.random.randint(len(self.tasks))]
 
 
-# ── Phase 0: PPO-based data collection ────────────────────────────────────
+# ── Phase 0 ────────────────────────────────────────────────────────────────
 
 def phase0_collect(
-    task_distribution: FourRoomsTaskDistribution,
+    task_distribution: MiniGridNavTaskDistribution,
     replay_buffer: ReplayBuffer,
-    timesteps_per_task: int = 10_000,
-    device: str = "cpu",
-    verbose: bool = True,
+    timesteps_per_task: int = 20_000,
+    n_envs: int             = 10,
+    device: str             = "cpu",
+    verbose: bool           = True,
 ) -> None:
-    """Use SB3 PPO (supports Discrete action spaces) to fill the replay buffer."""
     for task in task_distribution.tasks:
         if verbose:
-            print(f"  [Phase 0] Collecting from {task.env_name} "
-                  f"for {timesteps_per_task} steps with PPO...")
+            print(f"  [Phase 0] {task.env_name}  PPO × {n_envs} envs  "
+                  f"{timesteps_per_task} steps...")
 
-        def _make():
-            return task.create_env()
+        def _make(t=task):
+            return t.create_env()
 
-        vec_env = make_vec_env(_make, n_envs=1)
+        vec_env = make_vec_env(_make, n_envs=n_envs)
         model   = PPO("MlpPolicy", vec_env, verbose=0, device=device)
         model.learn(total_timesteps=timesteps_per_task)
 
-        obs = vec_env.reset()
-        for _ in range(timesteps_per_task):
+        obs           = vec_env.reset()
+        steps_per_env = max(1, timesteps_per_task // n_envs)
+        for _ in range(steps_per_env):
             action, _ = model.predict(obs, deterministic=False)
             obs_next, reward, done, info = vec_env.step(action)
-            truncated  = info[0].get("TimeLimit.truncated", False)
-            terminated = bool(done[0]) and not truncated
-            replay_buffer.push(
-                obs[0], action[0], float(reward[0]),
-                obs_next[0], bool(done[0]), task.id,
-                terminated=terminated,
-            )
-            obs = obs_next if not done[0] else vec_env.reset()
-
+            for i in range(n_envs):
+                trunc_i = info[i].get("TimeLimit.truncated", False)
+                term_i  = bool(done[i]) and not trunc_i
+                replay_buffer.push(
+                    obs[i], action[i], float(reward[i]),
+                    obs_next[i], bool(done[i]), task.id,
+                    terminated=term_i,
+                )
+            obs = obs_next
         vec_env.close()
 
     if verbose:
-        print(f"  [Phase 0] Buffer size: {len(replay_buffer)}")
+        print(f"  [Phase 0] Buffer: {len(replay_buffer)} transitions")
 
 
-# ── Phase 3: Per-task policies with shaped rewards ─────────────────────────
+# ── Phase 3 ────────────────────────────────────────────────────────────────
 
 def phase3_train_task_policies(
     skeleton_data: dict,
-    task_distribution: FourRoomsTaskDistribution,
+    task_distribution: MiniGridNavTaskDistribution,
     potential=None,
-    timesteps_per_task: int = 10_000,
+    timesteps_per_task: int = 20_000,
     shaping_scale: float    = 1.0,
     device: str             = "cpu",
     verbose: bool           = True,
     save_dir: str           = None,
     iteration: int          = 0,
 ) -> tuple:
-    """
-    Train one PPO policy per task with potential-based shaped rewards.
-
-    Returns (task_policies, phase3_stats) where:
-        task_policies — {task_id: PPO model}
-        phase3_stats  — {task_name: {"ep_rewards", "ep_env_rewards",
-                                     "ep_shaping", "ep_successes", "ep_lengths"}}
-    If save_dir is provided, saves phase3_iter_{N:03d}.png there.
-    """
     task_policies: dict = {}
     phase3_stats:  dict = {}
 
     for task in task_distribution.tasks:
         if verbose:
-            print(f"  [Phase 3] Training policy for {task.env_name} (task {task.id})...")
+            print(f"  [Phase 3] {task.env_name} (task {task.id})...")
 
         def _make_env(t=task, pot=potential, scale=shaping_scale):
             env = t.create_env()
@@ -251,16 +229,15 @@ def phase3_train_task_policies(
             "ep_lengths":     cb.ep_lengths,
         }
         if verbose and cb.ep_rewards:
-            last20 = cb.ep_rewards[-20:]
-            sr     = float(np.mean(cb.ep_successes[-20:])) if cb.ep_successes else 0.0
-            print(f"    last-20-ep: avg_shaped_r={np.mean(last20):.3f}  "
-                  f"success_rate={sr:.1%}")
+            sr = float(np.mean(cb.ep_successes[-20:])) if cb.ep_successes else 0.0
+            print(f"    last-20-ep avg_r={np.mean(cb.ep_rewards[-20:]):.3f}  "
+                  f"success={sr:.1%}")
 
     if save_dir is not None:
         plot_phase3_results(phase3_stats, save_dir, iteration=iteration)
 
     if verbose:
-        print(f"  [Phase 3] Trained {len(task_policies)} task policy/ies.")
+        print(f"  [Phase 3] Trained {len(task_policies)} policies.")
     return task_policies, phase3_stats
 
 
@@ -268,53 +245,52 @@ def phase3_train_task_policies(
 
 def evaluate_policy(
     meta_policy,
-    task_distribution: FourRoomsTaskDistribution,
+    task_distribution: MiniGridNavTaskDistribution,
     n_episodes: int = 20,
-    max_steps: int  = 200,
+    max_steps: int  = 500,
     gamma: float    = 0.99,
     device: str     = "cpu",
 ) -> dict:
     meta_policy.eval()
-    successes: list = []
-    returns:   list = []
+    successes:   list = []
+    returns:     list = []
     env_results: dict = {}
 
     for _ in range(n_episodes):
-        task   = task_distribution.sample()
-        env    = task.create_env()
-        result = env.reset()
-        s      = result[0] if isinstance(result, tuple) else result
-        tau    = []
-        done   = False
-        ep_return = 0.0
-        t      = 0
+        task    = task_distribution.sample()
+        env     = task.create_env()
+        obs, _  = env.reset()
+        obs_arr = np.asarray(obs, dtype=np.float32).flatten()
+        tau     = []
+        done    = False
+        ep_ret  = 0.0
+        t       = 0
         success = False
 
         while not done and t < max_steps:
             with torch.no_grad():
-                a_dist = meta_policy(s, tau)
+                a_dist = meta_policy(obs_arr, tau)
                 a      = a_dist.sample()
             a_np  = a.cpu().numpy().flatten()
-            a_env = int(a_np[0]) if meta_policy.discrete else a_np
+            a_env = int(a_np[0])
             s_next, r, terminated, truncated, info = env.step(a_env)
             done    = terminated or truncated
             success = success or bool(info.get("success", 0.0) > 0.5)
-            ep_return += (gamma ** t) * r
-            tau.append((np.asarray(s, dtype=np.float32), a_np, r))
-            s = s_next
+            ep_ret += (gamma ** t) * r
+            tau.append((obs_arr, a_np, r))
+            obs_arr = np.asarray(s_next, dtype=np.float32).flatten()
             t += 1
 
         env.close()
         successes.append(float(success))
-        returns.append(ep_return)
+        returns.append(ep_ret)
         env_results.setdefault(task.env_name, []).append(float(success))
 
     meta_policy.train()
-    per_env = {k: float(np.mean(v)) for k, v in env_results.items()}
     return {
         "success_rate": float(np.mean(successes)),
         "avg_return":   float(np.mean(returns)),
-        "per_env":      per_env,
+        "per_env":      {k: float(np.mean(v)) for k, v in env_results.items()},
     }
 
 
@@ -323,16 +299,13 @@ def evaluate_policy(
 def run_demos(
     meta_policy,
     skeleton_data: dict,
-    task_distribution: FourRoomsTaskDistribution,
+    task_distribution: MiniGridNavTaskDistribution,
     save_dir: str,
     n_demos: int   = 5,
-    max_steps: int = 200,
+    max_steps: int = 500,
     gamma: float   = 0.99,
     device: str    = "cpu",
 ) -> list:
-    """
-    Run demo episodes with the GRU meta-policy and save grid renders + JSON summary.
-    """
     import matplotlib.pyplot as plt
     from sklearn.decomposition import PCA
 
@@ -342,94 +315,113 @@ def run_demos(
     lm_np    = skeleton_data["landmarks"].cpu().numpy()
     D        = lm_np.shape[1]
     pca      = PCA(n_components=2).fit(lm_np) if D > 2 else None
-    proj     = lambda s: pca.transform(np.asarray(s).reshape(1, -1))[0] if pca else np.asarray(s)[:2]
-    lm_2d    = pca.transform(lm_np) if pca else lm_np[:, :2]
-    crit_2d  = (pca.transform(np.stack(c_states)) if (pca and c_states)
-                else (np.stack(c_states)[:, :2] if c_states else np.empty((0, 2))))
+
+    def _proj(s):
+        arr = np.asarray(s, dtype=np.float32).flatten()
+        return pca.transform(arr.reshape(1, -1))[0] if pca else arr[:2]
+
+    lm_2d   = pca.transform(lm_np) if pca else lm_np[:, :2]
+    crit_2d = (pca.transform(np.stack(c_states)) if (pca and c_states)
+               else (np.stack(c_states)[:, :2] if c_states else np.empty((0, 2))))
 
     meta_policy.eval()
     results = []
+
     for demo_i in range(n_demos):
-        task   = task_distribution.sample()
-        env    = task.create_env()
-        result = env.reset()
-        s      = result[0] if isinstance(result, tuple) else result
-        s_arr  = np.asarray(s, dtype=np.float32).flatten()
-        tau    = []
-        traj_pts = [proj(s_arr)]
-        ep_return = 0.0
-        t     = 0
-        done  = False
+        task    = task_distribution.sample()
+        env     = task.create_env()
+        obs, _  = env.reset()
+        obs_arr = np.asarray(obs, dtype=np.float32).flatten()
+        tau     = []
+        grid_pts = []   # (agent_x, agent_y) in grid coords
+        pca_pts  = []
+        ep_ret  = 0.0
+        t       = 0
+        done    = False
         success = False
 
         while not done and t < max_steps:
+            ax = obs_arr[0] * GRID_SIZE
+            ay = obs_arr[1] * GRID_SIZE
+            grid_pts.append([ax, ay])
+            pca_pts.append(_proj(obs_arr))
+
             with torch.no_grad():
-                a_dist = meta_policy(s_arr, tau)
+                a_dist = meta_policy(obs_arr, tau)
                 a      = a_dist.sample()
             a_np  = a.cpu().numpy().flatten()
-            a_env = int(a_np[0]) if meta_policy.discrete else a_np
-            s_next, r, terminated, truncated, info = env.step(a_env)
+            s_next, r, terminated, truncated, info = env.step(int(a_np[0]))
             done    = terminated or truncated
             success = success or bool(info.get("success", 0.0) > 0.5)
-            ep_return += (gamma ** t) * r
-            tau.append((s_arr, a_np, r))
-            s_arr = np.asarray(s_next, dtype=np.float32).flatten()
-            traj_pts.append(proj(s_arr))
+            ep_ret += (gamma ** t) * r
+            tau.append((obs_arr, a_np, r))
+            obs_arr = np.asarray(s_next, dtype=np.float32).flatten()
             t += 1
 
         env.close()
-        result_d = {
+        grid_pts.append([obs_arr[0] * GRID_SIZE, obs_arr[1] * GRID_SIZE])
+        pca_pts.append(_proj(obs_arr))
+
+        results.append({
             "demo": demo_i, "task": task.env_name,
-            "success": success, "return": ep_return, "steps": t,
-        }
-        results.append(result_d)
+            "success": success, "return": ep_ret, "steps": t,
+        })
 
-        traj   = np.array(traj_pts)
-        status = "success" if success else "fail"
-        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+        grid_arr = np.array(grid_pts)
+        pca_arr  = np.array(pca_pts)
+        status   = "success" if success else "fail"
 
-        # Left: grid trajectory
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Left: grid view
         ax = axes[0]
-        grid_size = env.grid_size if hasattr(env, "grid_size") else 11
-        ax.set_xlim(-0.5, grid_size - 0.5)
-        ax.set_ylim(-0.5, grid_size - 0.5)
+        gs = GRID_SIZE
+        c  = gs // 2  # wall centre
+        ax.set_xlim(-0.5, gs - 0.5)
+        ax.set_ylim(-0.5, gs - 0.5)
         ax.set_aspect("equal")
-        c = grid_size // 2
-        ax.plot([c - 0.5, c - 0.5], [-0.5, c - 0.5], "k-", lw=2)
-        ax.plot([c - 0.5, c - 0.5], [c + 0.5, grid_size - 0.5], "k-", lw=2)
-        ax.plot([c + 0.5, c + 0.5], [-0.5, c - 0.5], "k-", lw=2)
-        ax.plot([c + 0.5, c + 0.5], [c + 0.5, grid_size - 0.5], "k-", lw=2)
-        for k in range(len(traj_pts) - 1):
-            ax.plot([traj_pts[k][0], traj_pts[k+1][0]],
-                    [traj_pts[k][1], traj_pts[k+1][1]],
-                    color=_c(k), lw=1.2, alpha=0.8)
-        ax.plot(*traj_pts[0][:2],  marker="^", ms=10, color=_P["blue"],
-                label="start", zorder=5)
-        ax.plot(*traj_pts[-1][:2], marker="*", ms=12,
+        # four-rooms wall outline
+        for seg in [
+            ([c - 0.5, c - 0.5], [-0.5, c - 0.5]),
+            ([c - 0.5, c - 0.5], [c + 0.5, gs - 0.5]),
+            ([c + 0.5, c + 0.5], [-0.5, c - 0.5]),
+            ([c + 0.5, c + 0.5], [c + 0.5, gs - 0.5]),
+        ]:
+            ax.plot(seg[0], seg[1], "k-", lw=1.5)
+        # goal marker
+        gx = obs_arr[3] * GRID_SIZE
+        gy = obs_arr[4] * GRID_SIZE
+        ax.plot(gx, gy, marker="*", ms=14, color=_P["gold"], zorder=4, label="goal")
+        for k in range(len(grid_arr) - 1):
+            ax.plot(grid_arr[k:k+2, 0], grid_arr[k:k+2, 1],
+                    color=_c(k), lw=1.0, alpha=0.7)
+        ax.plot(*grid_arr[0],  marker="^", ms=9, color=_P["blue"], zorder=5, label="start")
+        ax.plot(*grid_arr[-1], marker="*", ms=11,
                 color=_P["gold"] if success else _P["red"],
-                label="end (✓)" if success else "end (✗)", zorder=5)
-        ax.legend(fontsize=8)
+                zorder=5, label="end (✓)" if success else "end (✗)")
+        ax.legend(fontsize=7, loc="upper right")
         ax.axis("off")
 
-        # Right: PCA skeleton projection
+        # Right: PCA skeleton
         ax = axes[1]
         ax.scatter(lm_2d[:, 0], lm_2d[:, 1], s=20, c=_P["mid"], alpha=0.5)
         if len(crit_2d):
             ax.scatter(crit_2d[:, 0], crit_2d[:, 1], s=150,
                        facecolors="none", edgecolors=_P["red"], lw=1.5)
-        for k in range(len(traj) - 1):
-            ax.plot(traj[k:k+2, 0], traj[k:k+2, 1],
+        for k in range(len(pca_arr) - 1):
+            ax.plot(pca_arr[k:k+2, 0], pca_arr[k:k+2, 1],
                     color=_P["blue"], lw=1.0, alpha=0.6)
-        ax.plot(*traj[0],  marker="^", ms=8, color=_P["blue"], zorder=5)
-        ax.plot(*traj[-1], marker="*", ms=10,
+        ax.plot(*pca_arr[0],  marker="^", ms=8, color=_P["blue"], zorder=5)
+        ax.plot(*pca_arr[-1], marker="*", ms=10,
                 color=_P["gold"] if success else _P["red"], zorder=5)
         ax.axis("off")
 
         fig.tight_layout()
-        out = os.path.join(save_dir, f"demo_{demo_i:02d}_{task.env_name}_{status}.png")
+        out = os.path.join(save_dir,
+                           f"demo_{demo_i:02d}_{task.env_name}_{status}.png")
         _save_fig(fig, out)
         print(f"  [Demo {demo_i}] {task.env_name}  {status}  "
-              f"return={ep_return:.3f}  steps={t}")
+              f"return={ep_ret:.3f}  steps={t}")
 
     meta_policy.train()
     with open(os.path.join(save_dir, "demo_summary.json"), "w") as f:
@@ -441,36 +433,39 @@ def run_demos(
 # ── Main pipeline ──────────────────────────────────────────────────────────
 
 def main(
-    task_distribution: FourRoomsTaskDistribution = None,
-    num_landmarks: int        = 16,
-    num_iterations: int       = 5,
-    refine_every: int         = 2,
-    timesteps_per_task: int   = 10_000,
-    task_steps: int           = 10_000,
-    collect_episodes: int     = 50,
-    gamma: float              = 0.99,
-    shaping_scale: float      = 1.0,
-    subgoal_threshold: float  = float("inf"),
-    potential_alpha: float    = 0.5,
-    meta_epochs: int          = 200,
-    episodes_per_update: int  = 4,
-    entropy_coef: float       = 0.01,
-    is_buffer_size: int       = 16,
-    is_clip_epsilon: float    = 0.2,
-    eval_episodes: int        = 20,
-    n_demos: int              = 5,
-    save_dir: str             = "results/four_rooms",
-    device: str               = "cpu",
-    verbose: bool             = True,
+    task_distribution: MiniGridNavTaskDistribution = None,
+    num_landmarks: int       = 64,
+    num_iterations: int      = 5,
+    refine_every: int        = 2,
+    timesteps_per_task: int  = 20_000,
+    n_envs: int              = 10,
+    task_steps: int          = 20_000,
+    collect_episodes: int    = 50,
+    gamma: float             = 0.99,
+    shaping_scale: float     = 1.0,
+    subgoal_threshold: float = float("inf"),
+    potential_alpha: float   = 0.5,
+    meta_epochs: int         = 200,
+    episodes_per_update: int = 4,
+    entropy_coef: float      = 0.01,
+    is_buffer_size: int      = 16,
+    is_clip_epsilon: float   = 0.2,
+    eval_episodes: int       = 20,
+    n_demos: int             = 5,
+    save_dir: str            = "results/minigrid_nav",
+    device: str              = "cpu",
+    verbose: bool            = True,
 ):
+    if not _MINIGRID_OK:
+        raise RuntimeError("minigrid not installed.  Run: pip install minigrid")
     if task_distribution is None:
-        task_distribution = FourRoomsTaskDistribution()
+        task_distribution = MiniGridNavTaskDistribution()
 
     os.makedirs(save_dir, exist_ok=True)
 
     if verbose:
         print("=" * 60)
-        print("Meta-RL pipeline  (Four Rooms)")
+        print("Meta-RL pipeline  (MiniGrid FourRooms Navigation)")
         print(f"  tasks: {[t.env_name for t in task_distribution.tasks]}")
         print(f"  landmarks: {num_landmarks}  iterations: {num_iterations}")
         print(f"  save_dir: {save_dir}")
@@ -483,7 +478,6 @@ def main(
         "eval_success_rates":    [],
         "eval_returns":          [],
     }
-
     tracker = BestModelTracker(save_dir, higher_is_better=True)
 
     # Phase 0
@@ -498,6 +492,7 @@ def main(
             print("\n[Phase 0] Collecting initial data with PPO...")
         phase0_collect(task_distribution, rb,
                        timesteps_per_task=timesteps_per_task,
+                       n_envs=n_envs,
                        device=device, verbose=verbose)
         save_replay_buffer(rb, rb_path)
     if verbose:
@@ -510,7 +505,7 @@ def main(
                                      state_dim=STATE_DIM, action_dim=ACTION_DIM,
                                      num_landmarks=num_landmarks,
                                      device=device, verbose=verbose)
-    skeleton["_potential_stale"] = True   # force Phase 2 build on first iteration
+    skeleton["_potential_stale"] = True
     metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
     n_sub = len(skeleton["critical_states"])
     if verbose:
@@ -520,7 +515,7 @@ def main(
             for tid, s in knn_est.back_ret_stats().items():
                 flag = "  ← FLAT phi" if s["std"] < 0.01 else ""
                 print(f"  [KNN] task {tid}: n={s['n']:5d}  "
-                      f"back_ret mean={s['mean']:+.4f}  std={s['std']:.4f}{flag}")
+                      f"mean={s['mean']:+.4f}  std={s['std']:.4f}{flag}")
 
     plot_skeleton_topology(skeleton, rb,
                            os.path.join(save_dir, "topology_initial.png"))
@@ -533,7 +528,7 @@ def main(
     meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True).to(device)
     meta_value_net = None
     task_policies  = {}
-    training_state = None   # carries meta_value_net / optimizer / is_buffer across iterations
+    training_state = None
 
     for iteration in range(num_iterations):
         if verbose:
@@ -541,20 +536,17 @@ def main(
             print(f"Iteration {iteration + 1}/{num_iterations}")
             print(f"{'─'*60}")
 
-        # Phase 2 — combined potential (skeleton + empirical, normalised)
+        # Phase 2
         if verbose:
-            print(f"[Phase 2] Building combined potential (α={potential_alpha:.2f})...")
+            print(f"[Phase 2] Combined potential (α={potential_alpha:.2f})...")
         potential = phase2_build_potential(
-            skeleton,
-            replay_buffer=rb,
-            alpha=potential_alpha,
-            gamma=gamma,
-            verbose=verbose,
+            skeleton, replay_buffer=rb,
+            alpha=potential_alpha, gamma=gamma, verbose=verbose,
         )
 
-        # Phase 3 — one PPO policy per task with shaped rewards
+        # Phase 3
         if verbose:
-            print("[Phase 3] Training task policies with shaped rewards...")
+            print("[Phase 3] Training task policies...")
         task_policies, p3_stats = phase3_train_task_policies(
             skeleton, task_distribution,
             potential=potential,
@@ -568,9 +560,9 @@ def main(
                                 if v["ep_successes"]]) if p3_stats else 0.0)
         metrics["phase3_success_rates"].append(p3_sr)
 
-        # Phase 4 — meta-policy gradient with skeleton shaping
+        # Phase 4
         if verbose:
-            print("[Phase 4] Training meta-policy via policy gradient...")
+            print("[Phase 4] Training meta-policy...")
         training_skeleton = dict(skeleton)
         training_skeleton["skeleton_potential"] = potential
         meta_policy, meta_value_net, p4_losses, training_state = \
@@ -609,36 +601,31 @@ def main(
             meta_policy=meta_policy, meta_value_net=meta_value_net,
             task_policies=task_policies,
             skeleton_data=skeleton, replay_buffer=rb,
-            metrics={
-                "eval": eval_result,
-                "p4_avg_return": float(np.mean(p4_losses)) if p4_losses else 0.0,
-            },
+            metrics={"eval": eval_result,
+                     "p4_avg_return": float(np.mean(p4_losses)) if p4_losses else 0.0},
         )
-        improved = tracker.update(eval_result["success_rate"], ckpt_dir)
-        if verbose and improved:
+        if tracker.update(eval_result["success_rate"], ckpt_dir) and verbose:
             print(f"  ★ New best (success_rate={eval_result['success_rate']:.1%})")
 
         save_iteration_visuals(skeleton, rb, metrics, save_dir, iteration)
 
-        # Collect more data with trained meta-policy
+        # Collect more data
         meta_policy.eval()
         for _ in range(collect_episodes):
             task    = task_distribution.sample()
             env     = task.create_env()
-            result  = env.reset()
-            obs_arr = np.asarray(result[0] if isinstance(result, tuple) else result,
-                                 dtype=np.float32).flatten()
-            tau  = []
-            done = False
+            obs, _  = env.reset()
+            obs_arr = np.asarray(obs, dtype=np.float32).flatten()
+            tau     = []
+            done    = False
             while not done:
                 with torch.no_grad():
                     a_dist = meta_policy(obs_arr, tau)
                     a      = a_dist.sample()
-                a_np  = a.cpu().numpy().flatten()
-                a_env = int(a_np[0]) if meta_policy.discrete else a_np
-                obs_next, r, terminated, truncated, _ = env.step(a_env)
+                a_np = a.cpu().numpy().flatten()
+                s_next, r, terminated, truncated, _ = env.step(int(a_np[0]))
                 done         = terminated or truncated
-                obs_next_arr = np.asarray(obs_next, dtype=np.float32).flatten()
+                obs_next_arr = np.asarray(s_next, dtype=np.float32).flatten()
                 rb.push(obs_arr, a_np, r, obs_next_arr, done, task.id,
                         terminated=terminated)
                 tau.append((obs_arr, a_np, r))
@@ -650,16 +637,16 @@ def main(
         if verbose:
             print(f"  Buffer: {len(rb)} transitions")
 
-        # Periodic skeleton refinement
+        # Periodic refinement
         if (iteration + 1) % refine_every == 0 and iteration < num_iterations - 1:
             if verbose:
-                print("[Refine] Rebuilding skeleton on enlarged buffer...")
+                print("[Refine] Rebuilding skeleton...")
             skeleton = refine_skeleton(skeleton, rb,
                                        num_landmarks=num_landmarks,
                                        device=device, verbose=verbose)
-            skeleton["_potential_stale"] = True   # topology changed; rebuild potential next iter
+            skeleton["_potential_stale"] = True
             if training_state is not None:
-                training_state["is_buffer"] = None  # discard stale episodes (old potential's returns)
+                training_state["is_buffer"] = None
             metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
             n_sub = len(skeleton["critical_states"])
             if verbose:
@@ -669,21 +656,20 @@ def main(
                     for tid, s in knn_est.back_ret_stats().items():
                         flag = "  ← FLAT phi" if s["std"] < 0.01 else ""
                         print(f"  [KNN] task {tid}: n={s['n']:5d}  "
-                              f"back_ret mean={s['mean']:+.4f}  std={s['std']:.4f}{flag}")
+                              f"mean={s['mean']:+.4f}  std={s['std']:.4f}{flag}")
             if n_sub == 0:
                 print("  No subgoals after refinement; stopping.")
                 break
 
     plot_training_curves(metrics, save_dir)
 
-    # Demos from best model
     best_dir = os.path.join(save_dir, "best")
     if os.path.isdir(best_dir) and n_demos > 0:
         if verbose:
             print(f"\n[Demo] Running {n_demos} demos with best model...")
         try:
             best_ckpt = load_checkpoint(best_dir, device=device)
-            demo_mp, _, demo_tp, demo_skel = restore_models(
+            demo_mp, _, _, demo_skel = restore_models(
                 best_ckpt, STATE_DIM, ACTION_DIM, discrete=True, device=device,
             )
             run_demos(demo_mp, demo_skel, task_distribution,
@@ -693,54 +679,47 @@ def main(
             print(f"  [Demo] Error: {e}")
 
     if verbose:
-        print("\nFour-Rooms pipeline complete.")
-
+        print("\nMiniGrid Nav pipeline complete.")
     return meta_policy, task_policies, skeleton, metrics
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Meta-RL on Four-Rooms gridworld")
-    parser.add_argument("--tasks",        nargs="+", default=list(TASK_CONFIGS.keys()),
-                        choices=list(TASK_CONFIGS.keys()),
-                        help="Task keys to include (default: all A B C D)")
-    parser.add_argument("--iterations",   type=int, default=2)
-    parser.add_argument("--landmarks",    type=int, default=200)
-    parser.add_argument("--meta-epochs",        type=int, default=200)
-    parser.add_argument("--episodes-per-update", type=int, default=4,
-                        help="Episodes collected per gradient update in Phase 4 (default: 4)")
-    parser.add_argument("--entropy-coef", type=float, default=0.01,
-                        help="Entropy bonus coefficient for meta-policy loss (default: 0.01)")
-    parser.add_argument("--is-buffer-size", type=int, default=16,
-                        help="Number of recent episodes in IS trajectory buffer (default: 16)")
-    parser.add_argument("--is-clip-epsilon", type=float, default=0.2,
-                        help="PPO-style IS ratio clip epsilon (default: 0.2)")
-    parser.add_argument("--task-steps",   type=int, default=10_000,
-                        help="PPO timesteps per task in Phase 3")
-    parser.add_argument("--shaping-scale",     type=float, default=1.0,
-                        help="Potential shaping scale")
-    parser.add_argument("--subgoal-threshold", type=float, default=float("inf"),
-                        help="Distance threshold for sparse shaping (inf = always shape)")
-    parser.add_argument("--potential-alpha", type=float, default=0.5,
-                        help="α for combined potential: α·skeleton + (1−α)·empirical (default: 0.5)")
-    parser.add_argument("--timesteps",    type=int,   default=10_000,
+    parser = argparse.ArgumentParser(
+        description="Meta-RL on MiniGrid FourRooms navigation")
+    parser.add_argument("--tasks",        nargs="+", default=list(TASK_GOALS.keys()),
+                        choices=list(TASK_GOALS.keys()),
+                        help="Task quadrants to include (default: all NW NE SW SE)")
+    parser.add_argument("--iterations",   type=int,   default=5)
+    parser.add_argument("--landmarks",    type=int,   default=64)
+    parser.add_argument("--meta-epochs",  type=int,   default=200)
+    parser.add_argument("--episodes-per-update", type=int, default=4)
+    parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument("--is-buffer-size",  type=int,   default=16)
+    parser.add_argument("--is-clip-epsilon", type=float, default=0.2)
+    parser.add_argument("--task-steps",   type=int,   default=20_000)
+    parser.add_argument("--timesteps",    type=int,   default=20_000,
                         help="PPO timesteps per task in Phase 0")
+    parser.add_argument("--n-envs",       type=int,   default=10)
+    parser.add_argument("--shaping-scale",     type=float, default=1.0)
+    parser.add_argument("--subgoal-threshold", type=float, default=float("inf"))
+    parser.add_argument("--potential-alpha",   type=float, default=0.5)
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--n-demos",      type=int, default=5)
-    parser.add_argument("--save-dir",     default="results/four_rooms")
+    parser.add_argument("--save-dir",     default="results/minigrid_nav")
     parser.add_argument("--load",         default=None, metavar="CKPT_DIR")
     parser.add_argument("--demo-only",    action="store_true")
     parser.add_argument("--device",       default="cpu")
     args = parser.parse_args()
 
-    dist = FourRoomsTaskDistribution(task_keys=args.tasks)
+    dist = MiniGridNavTaskDistribution(task_keys=args.tasks)
 
     if args.demo_only:
         if args.load is None:
             parser.error("--demo-only requires --load <checkpoint_dir>")
         ckpt = load_checkpoint(args.load, device=args.device)
-        mp, _, tp, skel = restore_models(
+        mp, _, _, skel = restore_models(
             ckpt, STATE_DIM, ACTION_DIM, discrete=True, device=args.device,
         )
         run_demos(mp, skel, dist,
@@ -752,6 +731,7 @@ if __name__ == "__main__":
             num_landmarks=args.landmarks,
             num_iterations=args.iterations,
             timesteps_per_task=args.timesteps,
+            n_envs=args.n_envs,
             task_steps=args.task_steps,
             gamma=0.99,
             shaping_scale=args.shaping_scale,

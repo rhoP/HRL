@@ -248,6 +248,7 @@ def meta_policy_gradient_with_skeleton_shaping(
     replay_buffer            = None,
     device: str              = "cpu",
     verbose: bool            = True,
+    training_state: dict     = None,
 ):
     """
     Train meta-policy using IS-corrected policy gradient with skeleton-based
@@ -262,10 +263,16 @@ def meta_policy_gradient_with_skeleton_shaping(
     If `replay_buffer` is provided each collected transition (using raw env
     reward) is pushed to it, so Phase 1 skeleton data grows during training.
 
+    `training_state` carries {meta_value_net, optimizer, is_buffer} across
+    outer-loop iterations so Adam moments, baseline weights, and buffered
+    episodes are not thrown away between calls.  Pass None on the first call;
+    pass back the returned dict on subsequent calls.
+
     Returns:
         meta_policy      — trained policy (same object, in-place)
         meta_value_net   — trained value baseline
         epoch_losses     — list of per-epoch total losses
+        training_state   — dict to pass back on the next call for continuity
     """
     meta_subgoals      = skeleton_data["meta_subgoals"]
     skeleton_potential = skeleton_data["skeleton_potential"]
@@ -273,13 +280,22 @@ def meta_policy_gradient_with_skeleton_shaping(
     n_tasks             = len(task_distribution.tasks)
     episodes_per_update = max(1, min(episodes_per_update, n_tasks))
 
-    state_dim      = meta_policy.state_dim
-    meta_value_net = MetaValueNetwork(state_dim, meta_policy.gru_hidden).to(device)
+    state_dim = meta_policy.state_dim
+    ts        = training_state or {}
 
-    optimizer = torch.optim.Adam(
-        list(meta_policy.parameters()) + list(meta_value_net.parameters()),
-        lr=lr,
-    )
+    meta_value_net = (ts.get("meta_value_net") or
+                      MetaValueNetwork(state_dim, meta_policy.gru_hidden).to(device))
+
+    if ts.get("optimizer") is not None:
+        optimizer = ts["optimizer"]
+    else:
+        optimizer = torch.optim.Adam(
+            list(meta_policy.parameters()) + list(meta_value_net.parameters()),
+            lr=lr,
+        )
+
+    is_buffer = (ts.get("is_buffer") or
+                 TrajectoryBuffer(max_episodes=is_buffer_size))
 
     epoch_losses = []
     meta_policy.train()
@@ -287,7 +303,6 @@ def meta_policy_gradient_with_skeleton_shaping(
 
     task_list   = list(task_distribution.tasks)
     task_cursor = 0
-    is_buffer   = TrajectoryBuffer(max_episodes=is_buffer_size)
 
     for epoch in range(meta_epochs):
         # ── Collect fresh episodes (no gradient tracking) ─────────────────
@@ -372,4 +387,8 @@ def meta_policy_gradient_with_skeleton_shaping(
                   f"avg_shaped_r={avg_r:.4f}  "
                   f"success_rate={sr:.1%}")
 
-    return meta_policy, meta_value_net, epoch_losses
+    return meta_policy, meta_value_net, epoch_losses, {
+        "meta_value_net": meta_value_net,
+        "optimizer":      optimizer,
+        "is_buffer":      is_buffer,
+    }

@@ -32,7 +32,7 @@ from stable_baselines3.common.env_util import make_vec_env
 
 from models.meta_policy_net  import MetaPolicy, MetaValueNetwork
 from algos.potential         import (SkeletonPotential, EmpiricalHittingTimePotential,
-                                     ShapedRewardWrapper)
+                                     CombinedPotential, ShapedRewardWrapper)
 from algos.meta_policy_gradient import (meta_policy_gradient_with_skeleton_shaping,
                                          evaluate_meta_policy)
 from utils.replay_buffer  import ReplayBuffer
@@ -147,37 +147,51 @@ def phase0_collect_initial_data(
     task_distribution: MetaWorldTaskDistribution,
     replay_buffer: ReplayBuffer,
     timesteps_per_task: int = 5_000,
+    n_envs: int             = 10,
     algo: str               = "SAC",
     device: str             = "cpu",
     verbose: bool           = True,
 ) -> None:
-    """Use SAC (or PPO) from stable_baselines3 to fill the replay buffer."""
+    """
+    Use SAC (or PPO) from stable_baselines3 to fill the replay buffer.
+
+    n_envs parallel copies of each task env are run simultaneously.
+    The SB3 model trains for timesteps_per_task total steps across all envs,
+    then a separate rollout of the same length collects transitions into
+    replay_buffer (steps_per_env = timesteps_per_task // n_envs per env so
+    total transitions ≈ timesteps_per_task).
+    """
     AlgoCls = SAC if algo.upper() == "SAC" else PPO
 
     for task in task_distribution.tasks:
         if verbose:
             print(f"  [Phase 0] {task.env_name} (task {task.id}) — "
-                  f"{algo} for {timesteps_per_task} steps...")
+                  f"{algo} × {n_envs} envs, {timesteps_per_task} steps...")
 
         def _make_env(t=task):
             return MetaWorldGymWrapper(t)
 
-        vec_env = make_vec_env(_make_env, n_envs=1)
+        vec_env = make_vec_env(_make_env, n_envs=n_envs)
         model   = AlgoCls("MlpPolicy", vec_env, verbose=0, device=device)
         model.learn(total_timesteps=timesteps_per_task)
 
-        obs = vec_env.reset()
-        for _ in range(timesteps_per_task):
+        # Collect transitions from all envs in parallel.
+        # VecEnv auto-resets on episode end — obs_next[i] is the reset obs when
+        # done[i] is True, so we never call vec_env.reset() manually here.
+        obs            = vec_env.reset()
+        steps_per_env  = max(1, timesteps_per_task // n_envs)
+        for _ in range(steps_per_env):
             action, _ = model.predict(obs, deterministic=False)
             obs_next, reward, done, info = vec_env.step(action)
-            truncated  = info[0].get("TimeLimit.truncated", False)
-            terminated = bool(done[0]) and not truncated
-            replay_buffer.push(
-                obs[0], action[0], float(reward[0]),
-                obs_next[0], bool(done[0]), task.id,
-                terminated=terminated,
-            )
-            obs = obs_next if not done[0] else vec_env.reset()
+            for i in range(n_envs):
+                trunc_i = info[i].get("TimeLimit.truncated", False)
+                term_i  = bool(done[i]) # and not trunc_i
+                replay_buffer.push(
+                    obs[i], action[i], float(reward[i]),
+                    obs_next[i], bool(done[i]), task.id,
+                    terminated=term_i,
+                )
+            obs = obs_next
         vec_env.close()
 
     if verbose:
@@ -213,20 +227,25 @@ def phase1_build_skeleton(
 
 def phase2_build_potential(
     skeleton_data: dict,
-    replay_buffer=None,
-    method: str          = "skeleton",
+    replay_buffer,
+    alpha: float         = 0.5,
     k: int               = 10,
     gamma: float         = 0.99,
     hit_threshold: float = 0.5,
     verbose: bool        = True,
 ):
     """
-    Build a potential function over the meta-skeleton.
+    Build a CombinedPotential over the meta-skeleton.
 
-    method="skeleton"  — SkeletonPotential (shortest-path graph distance).
-    method="empirical" — EmpiricalHittingTimePotential (k-NN replay-buffer).
+    Φ(s; c) = α · Φ̃_skeleton(s; c)  +  (1−α) · Φ̃_empirical(s; c)
 
-    Returns a potential object with .subgoals, .get_potential, .get_intrinsic_reward.
+    Both components are normalised to unit std over the landmark set before
+    mixing.  α=1 → pure graph topology; α=0 → pure empirical returns.
+
+    The SkeletonPotential is cached in skeleton_data["_skel_potential_cached"]
+    and rebuilt only when skeleton_data["_potential_stale"] is True, preserving
+    the shortest-path cache across iterations.  The EmpiricalHittingTimePotential
+    is always rebuilt so the empirical component improves as data accumulates.
     """
     raw = skeleton_data.get("meta_subgoals", {})
     if raw and not isinstance(next(iter(raw.values())), dict):
@@ -239,34 +258,39 @@ def phase2_build_potential(
         for k, v in raw.items()
     }
 
-    if method == "skeleton":
-        if verbose:
-            print(f"  [Phase 2] SkeletonPotential ({len(meta_subgoals)} subgoal(s))...")
-        lm    = skeleton_data["landmarks"]
-        lm_np = lm.cpu().numpy() if hasattr(lm, "cpu") else np.asarray(lm, dtype=np.float32)
-        pot   = SkeletonPotential(lm_np, skeleton_data["simplices"], meta_subgoals)
-        if verbose:
-            print(f"             graph: {pot.G.number_of_nodes()} nodes, "
-                  f"{pot.G.number_of_edges()} edges")
-        return pot
+    lm    = skeleton_data["landmarks"]
+    lm_np = lm.cpu().numpy() if hasattr(lm, "cpu") else np.asarray(lm, dtype=np.float32)
 
-    elif method == "empirical":
-        if replay_buffer is None:
-            raise ValueError("replay_buffer is required for method='empirical'.")
+    # Skeleton component — rebuild only when topology is stale
+    if skeleton_data.get("_potential_stale", True) or "_skel_potential_cached" not in skeleton_data:
+        skel_pot = SkeletonPotential(lm_np, skeleton_data["simplices"], meta_subgoals)
+        skeleton_data["_skel_potential_cached"] = skel_pot
+        skeleton_data["_potential_stale"]       = False
         if verbose:
-            print(f"  [Phase 2] EmpiricalHittingTimePotential (k={k}, γ={gamma})...")
-        pot       = EmpiricalHittingTimePotential(
-            replay_buffer, meta_subgoals,
-            k=k, gamma=gamma, hit_threshold=hit_threshold,
-        )
-        n_covered = sum(len(v) > 0 for v in pot._trajs.values())
-        if verbose:
-            print(f"             {n_covered}/{len(meta_subgoals)} subgoal(s) "
-                  f"have hitting trajectories")
-        return pot
-
+            print(f"  [Phase 2] SkeletonPotential ({len(meta_subgoals)} subgoal(s)): "
+                  f"{skel_pot.G.number_of_nodes()} nodes, "
+                  f"{skel_pot.G.number_of_edges()} edges")
     else:
-        raise ValueError(f"Unknown method={method!r}. Use 'skeleton' or 'empirical'.")
+        skel_pot = skeleton_data["_skel_potential_cached"]
+        if verbose:
+            print(f"  [Phase 2] Reusing cached SkeletonPotential.")
+
+    # Empirical component — always rebuilt (buffer grows each iteration)
+    emp_pot   = EmpiricalHittingTimePotential(
+        replay_buffer, meta_subgoals,
+        k=k, gamma=gamma, hit_threshold=hit_threshold,
+    )
+    n_covered = sum(len(v) > 0 for v in emp_pot._trajs.values())
+    if verbose:
+        print(f"  [Phase 2] EmpiricalHittingTimePotential (k={k}, γ={gamma}): "
+              f"{n_covered}/{len(meta_subgoals)} subgoal(s) with hitting trajectories")
+
+    combined = CombinedPotential(skel_pot, emp_pot, lm_np, alpha=alpha)
+    if verbose:
+        print(f"  [Phase 2] CombinedPotential α={alpha:.2f}  "
+              f"skel_scale={combined._skel_scale:.4f}  "
+              f"emp_scale={combined._emp_scale:.4f}")
+    return combined
 
 
 # ── Phase 3 ────────────────────────────────────────────────────────────────
@@ -384,13 +408,14 @@ def main_meta_rl_loop(
     num_iterations: int     = 3,
     refine_every: int       = 2,
     timesteps_per_task: int = 5_000,
+    n_envs: int             = 10,
     task_policy_steps: int  = 10_000,
     collect_episodes: int   = 20,
     gamma: float            = 0.99,
     meta_epochs: int        = 500,
     shaping_scale: float    = 1.0,
     subgoal_threshold: float = float("inf"),
-    phase2_method: str      = "skeleton",
+    potential_alpha: float  = 0.5,
     algo: str               = "SAC",
     eval_episodes: int      = 10,
     n_demos: int            = 5,
@@ -411,7 +436,7 @@ def main_meta_rl_loop(
         print("Meta-RL pipeline  (MetaWorld)")
         print(f"  tasks: {len(task_distribution.tasks)}, "
               f"landmarks: {num_landmarks}, iterations: {num_iterations}")
-        print(f"  phase2: {phase2_method}  shaping_scale: {shaping_scale}")
+        print(f"  potential_alpha: {potential_alpha}  shaping_scale: {shaping_scale}")
         print(f"  save_dir: {save_dir}")
         print("=" * 60)
 
@@ -439,6 +464,7 @@ def main_meta_rl_loop(
         phase0_collect_initial_data(
             task_distribution, rb,
             timesteps_per_task=timesteps_per_task,
+            n_envs=n_envs,
             algo=algo, device=device, verbose=verbose,
         )
         save_replay_buffer(rb, rb_path)
@@ -458,6 +484,7 @@ def main_meta_rl_loop(
     if verbose:
         print(f"  Found {n_sub} meta-subgoal(s).")
 
+    skeleton["_potential_stale"] = True
     plot_skeleton_topology(skeleton, rb,
                            os.path.join(save_dir, "topology_initial.png"))
 
@@ -470,6 +497,7 @@ def main_meta_rl_loop(
     meta_policy    = MetaPolicy(state_dim, action_dim,
                                 discrete=discrete).to(device)
     meta_value_net = None
+    training_state = None
 
     for iteration in range(num_iterations):
         if verbose:
@@ -477,12 +505,12 @@ def main_meta_rl_loop(
             print(f"Iteration {iteration + 1}/{num_iterations}")
             print(f"{'─'*60}")
 
-        # Phase 2
+        # Phase 2 — combined potential (skeleton + empirical, normalised)
         if verbose:
-            print(f"[Phase 2] Building {phase2_method} potential...")
+            print(f"[Phase 2] Building combined potential (α={potential_alpha:.2f})...")
         potential = phase2_build_potential(
             skeleton, rb,
-            method=phase2_method,
+            alpha=potential_alpha,
             gamma=gamma, verbose=verbose,
         )
 
@@ -508,7 +536,7 @@ def main_meta_rl_loop(
         training_skeleton = dict(skeleton)
         training_skeleton["skeleton_potential"] = potential
 
-        meta_policy, meta_value_net, p4_losses = \
+        meta_policy, meta_value_net, p4_losses, training_state = \
             meta_policy_gradient_with_skeleton_shaping(
                 meta_policy, task_distribution, training_skeleton,
                 meta_epochs=meta_epochs,
@@ -516,6 +544,7 @@ def main_meta_rl_loop(
                 shaping_scale=shaping_scale,
                 subgoal_threshold=subgoal_threshold,
                 device=device, verbose=verbose,
+                training_state=training_state,
             )
         metrics["phase4_losses"].append(p4_losses)
 
@@ -567,6 +596,9 @@ def main_meta_rl_loop(
                 num_landmarks=num_landmarks,
                 device=device, verbose=verbose,
             )
+            skeleton["_potential_stale"] = True
+            if training_state is not None:
+                training_state["is_buffer"] = None
             metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
             n_sub = len(skeleton["critical_states"])
             if verbose:
@@ -613,12 +645,14 @@ if __name__ == "__main__":
     parser.add_argument("--landmarks",        type=int,   default=100)
     parser.add_argument("--meta-epochs",      type=int,   default=500)
     parser.add_argument("--task-steps",       type=int,   default=10_000)
-    parser.add_argument("--timesteps",        type=int,   default=5_000)
+    parser.add_argument("--timesteps",        type=int,   default=50_000)
     parser.add_argument("--shaping-scale",    type=float, default=1.0)
     parser.add_argument("--subgoal-threshold", type=float, default=float("inf"))
-    parser.add_argument("--phase2-method",    default="skeleton",
-                        choices=["skeleton", "empirical"])
-    parser.add_argument("--algo",             default="SAC", choices=["SAC", "PPO"])
+    parser.add_argument("--potential-alpha",  type=float, default=0.5,
+                        help="α for combined potential: α·skeleton + (1−α)·empirical (default: 0.5)")
+    parser.add_argument("--n-envs",           type=int, default=10,
+                        help="parallel envs for Phase 0 data collection (default: 10)")
+    parser.add_argument("--algo",             default="PPO", choices=["SAC", "PPO"])
     parser.add_argument("--eval-episodes",    type=int, default=10)
     parser.add_argument("--n-demos",          type=int, default=2)
     parser.add_argument("--save-dir",         default="results/meta_rl")
@@ -651,12 +685,13 @@ if __name__ == "__main__":
             num_landmarks=args.landmarks,
             num_iterations=args.iterations,
             timesteps_per_task=args.timesteps,
+            n_envs=args.n_envs,
             task_policy_steps=args.task_steps,
             gamma=0.99,
             meta_epochs=args.meta_epochs,
             shaping_scale=args.shaping_scale,
             subgoal_threshold=args.subgoal_threshold,
-            phase2_method=args.phase2_method,
+            potential_alpha=args.potential_alpha,
             algo=args.algo,
             eval_episodes=args.eval_episodes,
             n_demos=args.n_demos,

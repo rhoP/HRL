@@ -64,103 +64,99 @@ CMAP_SEQ = LinearSegmentedColormap.from_list(
 )
 
 
+# ── Figure save helper ─────────────────────────────────────────────────────
+
+def _save_fig(fig, path: str) -> None:
+    """Save figure as PNG; also write .tex via tikzplotlib or .pgf as fallback."""
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    stem = os.path.splitext(path)[0]
+    try:
+        import tikzplotlib
+        tikzplotlib.save(stem + ".tex", figure=fig,
+                         extra_axis_parameters={"width=\\linewidth"})
+    except Exception:
+        try:
+            fig.savefig(stem + ".pgf", bbox_inches="tight")
+        except Exception:
+            pass
+    plt.close(fig)
+
+
 # ── Training curves ────────────────────────────────────────────────────────
 
 def plot_training_curves(metrics: dict, save_dir: str) -> None:
     """
-    Plot all collected training metrics and save to <save_dir>/training_curves.png.
+    Write one PNG (+.tex) per metric series into save_dir.
 
-    Expected keys in metrics (all optional):
-        skeleton_train_losses  list[list[float]]  (unused; kept for compat)
-        phase2_losses          list[list[float]]  one inner list per (iteration, subgoal)
-        phase3_success_rates   list[float]        avg task success rate per iteration
-        phase4_returns         list[list[float]]  per-epoch policy-gradient losses
-        eval_returns           list[float]        one value per outer iteration
-        eval_success_rates     list[float]
+    Output files (only written when data is present):
+        metrics_phase2_td_loss.png/.tex
+        metrics_phase3_success.png/.tex
+        metrics_phase4_returns.png/.tex
+        metrics_eval.png/.tex
+
+    skeleton_train_losses is intentionally omitted.
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    panels = []
-    # Determine which subplots to draw
-    if metrics.get("skeleton_train_losses"):
-        panels.append("skeleton")
     if metrics.get("phase2_losses"):
-        panels.append("phase2")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        for i, run in enumerate(metrics["phase2_losses"]):
+            if run:
+                ax.plot(run, color=_c(i), alpha=0.8, label=f"iter {i}")
+        ax.set_xlabel("gradient step")
+        ax.set_ylabel("MSE loss")
+        ax.legend(fontsize=7)
+        fig.tight_layout()
+        out = os.path.join(save_dir, "metrics_phase2_td_loss.png")
+        _save_fig(fig, out)
+        print(f"  [Viz] {out}")
+
     if metrics.get("phase3_success_rates"):
-        panels.append("phase3")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        p3_sr = metrics["phase3_success_rates"]
+        ax.plot(range(len(p3_sr)), p3_sr, marker="o", color=_P["blue"], linewidth=1.8)
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("iteration")
+        ax.set_ylabel("avg success rate (all tasks)")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        out = os.path.join(save_dir, "metrics_phase3_success.png")
+        _save_fig(fig, out)
+        print(f"  [Viz] {out}")
+
     if metrics.get("phase4_returns"):
-        panels.append("phase4")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        for i, run in enumerate(metrics["phase4_returns"]):
+            if run:
+                ax.plot(run, color=_c(i), alpha=0.8, label=f"iter {i}")
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("return")
+        ax.legend(fontsize=7)
+        fig.tight_layout()
+        out = os.path.join(save_dir, "metrics_phase4_returns.png")
+        _save_fig(fig, out)
+        print(f"  [Viz] {out}")
+
     if metrics.get("eval_success_rates") or metrics.get("eval_returns"):
-        panels.append("eval")
-
-    if not panels:
-        return
-
-    n = len(panels)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4))
-    if n == 1:
-        axes = [axes]
-
-    for ax, panel in zip(axes, panels):
-        if panel == "skeleton":
-            losses = metrics["skeleton_train_losses"]
-            for i, run_losses in enumerate(losses):
-                ax.plot(run_losses, color=_c(i), alpha=0.8,
-                        label=f"iter {i}")
-            ax.set_title("Skeleton: training loss")
-            ax.set_xlabel("epoch"); ax.set_ylabel("MSE loss")
-            if len(losses) > 1:
-                ax.legend(fontsize=7)
-
-        elif panel == "phase2":
-            for i, run in enumerate(metrics["phase2_losses"]):
-                if run:
-                    ax.plot(run, color=_c(i), alpha=0.8, label=f"iter {i}")
-            ax.set_title("Phase 2: V_H TD loss")
-            ax.set_xlabel("gradient step"); ax.set_ylabel("MSE loss")
-
-        elif panel == "phase3":
-            p3_sr = metrics["phase3_success_rates"]
-            iters = list(range(len(p3_sr)))
-            ax.plot(iters, p3_sr, marker="o", color=_P["blue"],
-                    linewidth=1.8, label="avg task success rate")
-            ax.set_ylim(0, 1.05)
-            ax.set_title("Phase 3: Task Policy Success Rate")
-            ax.set_xlabel("iteration")
-            ax.set_ylabel("avg success rate (all tasks)")
-            ax.legend(fontsize=7)
-            ax.grid(alpha=0.3)
-
-        elif panel == "phase4":
-            for i, run in enumerate(metrics["phase4_returns"]):
-                if run:
-                    ax.plot(run, color=_c(i), alpha=0.8, label=f"iter {i}")
-            ax.set_title("Phase 4: Meta-policy avg option return")
-            ax.set_xlabel("epoch"); ax.set_ylabel("return")
-
-        elif panel == "eval":
-            iters = list(range(len(metrics.get("eval_success_rates", []))))
-            if metrics.get("eval_success_rates"):
-                ax.plot(iters, metrics["eval_success_rates"],
-                        marker="o", color=_P["blue"], label="success rate")
-                ax.set_ylabel("success rate", color=_P["blue"])
-                ax.tick_params(axis="y", labelcolor=_P["blue"])
-            if metrics.get("eval_returns"):
-                ax2 = ax.twinx()
-                ax2.plot(iters, metrics["eval_returns"],
-                         marker="s", color=_P["gold"],
-                         linestyle="--", label="avg return")
-                ax2.set_ylabel("avg return", color=_P["gold"])
-                ax2.tick_params(axis="y", labelcolor=_P["gold"])
-            ax.set_title("Evaluation (per iteration)")
-            ax.set_xlabel("iteration")
-
-    fig.suptitle("Meta-RL Training Metrics", fontsize=12, y=1.01)
-    fig.tight_layout()
-    out = os.path.join(save_dir, "training_curves.png")
-    fig.savefig(out, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [Viz] Training curves saved → {out}")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ref    = metrics.get("eval_success_rates") or metrics.get("eval_returns")
+        iters  = list(range(len(ref)))
+        if metrics.get("eval_success_rates"):
+            ax.plot(iters, metrics["eval_success_rates"],
+                    marker="o", color=_P["blue"])
+            ax.set_ylabel("success rate", color=_P["blue"])
+            ax.tick_params(axis="y", labelcolor=_P["blue"])
+        if metrics.get("eval_returns"):
+            ax2 = ax.twinx()
+            ax2.plot(iters, metrics["eval_returns"],
+                     marker="s", color=_P["gold"], linestyle="--")
+            ax2.set_ylabel("avg return", color=_P["gold"])
+            ax2.tick_params(axis="y", labelcolor=_P["gold"])
+        ax.set_xlabel("iteration")
+        fig.tight_layout()
+        out = os.path.join(save_dir, "metrics_eval.png")
+        _save_fig(fig, out)
+        print(f"  [Viz] {out}")
 
 
 # ── Skeleton topology ──────────────────────────────────────────────────────
@@ -241,29 +237,30 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer,
         ax.scatter(crit_xy[:, 0], crit_xy[:, 1],
                    s=200, facecolors="none", edgecolors=_P["red"],
                    linewidths=2.0, zorder=5)
-        for i, c_id in enumerate(c_ids):
-            ax.annotate(str(c_id),
-                        xy=crit_xy[i], xytext=(4, 4),
-                        textcoords="offset points", fontsize=8,
-                        color=_P["red"])
+    # Unwanted annotations for publication
+        #for i, c_id in enumerate(c_ids):
+        #    ax.annotate(str(c_id),
+        #                xy=crit_xy[i], xytext=(4, 4),
+        #                textcoords="offset points", fontsize=8,
+        #                color=_P["red"])
 
-    ax.set_title("Witness Complex & Discrete Morse Function (PCA projection)")
-    ax.set_xlabel("PC 1"); ax.set_ylabel("PC 2")
+    # ax.set_title("Witness Complex & Discrete Morse Function (PCA projection)")
+    # ax.set_xlabel("PC 1"); ax.set_ylabel("PC 2")
+    ax.axis('off')
 
-    legend_handles = [
-        mpatches.Patch(color=_P["light"], label="collected states"),
-        mpatches.Patch(color=_P["blue"], alpha=0.5, label="2-simplices"),
-        mpatches.Patch(color=_P["blue"], label="1-simplices"),
-        plt.Line2D([0], [0], marker="o", color="w",
-                   markerfacecolor=_P["mid"], markersize=7, label="landmarks (Morse)"),
-        plt.Line2D([0], [0], marker="o", color="w",
-                   markerfacecolor="none", markeredgecolor=_P["red"],
-                   markersize=10, markeredgewidth=2, label="critical states"),
-    ]
-    ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
+    #legend_handles = [
+    #    mpatches.Patch(color=_P["light"], label="collected states"),
+    #    mpatches.Patch(color=_P["blue"], alpha=0.5, label="2-simplices"),
+    #    mpatches.Patch(color=_P["blue"], label="1-simplices"),
+    #    plt.Line2D([0], [0], marker="o", color="w",
+    #               markerfacecolor=_P["mid"], markersize=7, label="landmarks (Morse)"),
+    #    plt.Line2D([0], [0], marker="o", color="w",
+    #               markerfacecolor="none", markeredgecolor=_P["red"],
+    #               markersize=10, markeredgewidth=2, label="critical states"),
+    #]
+    #ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
     fig.tight_layout()
-    fig.savefig(save_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    _save_fig(fig, save_path)
     print(f"  [Viz] Skeleton topology saved → {save_path}")
 
 
@@ -538,15 +535,15 @@ def run_demos(
                 color=_P["gold"] if success else _P["red"],
                 zorder=5, label="end (✓)" if success else "end (✗)")
 
-        title_suf = "✓ SUCCESS" if success else "✗ FAIL"
-        ax.set_title(f"Demo {demo_i} | {task.env_name} | {title_suf}\n"
-                     f"return={ep_return:.3f}  steps={t}")
-        ax.set_xlabel("PC 1"); ax.set_ylabel("PC 2")
         ax.legend(fontsize=7, loc="upper right")
+        ax.axis("off")
         fig.tight_layout()
-        traj_path = os.path.join(save_dir, f"demo_{demo_i:02d}_{task.env_name}_traj.png")
-        fig.savefig(traj_path, dpi=100, bbox_inches="tight")
-        plt.close(fig)
+        status_tag = "success" if success else "fail"
+        traj_path  = os.path.join(
+            save_dir,
+            f"demo_{demo_i:02d}_{task.env_name}_{status_tag}_traj.png",
+        )
+        _save_fig(fig, traj_path)
 
         status = "SUCCESS" if success else "fail"
         print(f"  [Demo {demo_i}] {task.env_name}  {status}  "
@@ -610,30 +607,28 @@ def plot_phase3_results(
     iteration: int = 0,
 ) -> None:
     """
-    Three-panel figure saved to <save_dir>/phase3_iter_{N:03d}.png.
+    Write three separate PNG (+.tex) files per iteration:
+        phase3_iter_{N:03d}_shaped_reward.png/.tex
+        phase3_iter_{N:03d}_reward_split.png/.tex
+        phase3_iter_{N:03d}_final_perf.png/.tex
 
     phase3_stats:
-        {task_name: {"ep_rewards":     list[float],   # total shaped reward/ep
-                     "ep_env_rewards": list[float],   # env-only reward/ep
-                     "ep_shaping":     list[float],   # cumulative shaping/ep
+        {task_name: {"ep_rewards":     list[float],
+                     "ep_env_rewards": list[float],
+                     "ep_shaping":     list[float],
                      "ep_successes":   list[float],
                      "ep_lengths":     list[int]}}
-
-    Panel 1 — Smoothed shaped-reward training curves, one line per task.
-    Panel 2 — Per-step env vs shaping reward split, stacked area per task.
-    Panel 3 — Final (last-20-ep) success rate + avg return, grouped bars.
     """
     if not phase3_stats:
         return
 
     os.makedirs(save_dir, exist_ok=True)
-    tasks = list(phase3_stats.keys())
-    n = len(tasks)
+    tasks  = list(phase3_stats.keys())
+    n      = len(tasks)
+    prefix = os.path.join(save_dir, f"phase3_iter_{iteration:03d}")
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-    # ── Panel 1: shaped reward learning curves ────────────────────────────
-    ax = axes[0]
+    # ── File 1: shaped reward learning curves ─────────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 4))
     for i, tname in enumerate(tasks):
         ep_r = phase3_stats[tname]["ep_rewards"]
         if not ep_r:
@@ -645,14 +640,15 @@ def plot_phase3_results(
             sm = np.convolve(ep_r, np.ones(w) / w, mode="valid")
             ax.plot(np.arange(w - 1, len(ep_r)), sm,
                     color=col, linewidth=2.0, label=tname)
-    ax.set_title(f"Shaped episode reward (iter {iteration})")
     ax.set_xlabel("episode")
     ax.set_ylabel("shaped reward")
     ax.legend(fontsize=7, loc="lower right")
     ax.grid(alpha=0.3)
+    fig.tight_layout()
+    _save_fig(fig, f"{prefix}_shaped_reward.png")
 
-    # ── Panel 2: env reward vs shaping bonus split ────────────────────────
-    ax = axes[1]
+    # ── File 2: env reward vs shaping bonus split ──────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 4))
     has_shaping = any(
         any(v != 0 for v in phase3_stats[t].get("ep_shaping", []))
         for t in tasks
@@ -663,9 +659,8 @@ def plot_phase3_results(
             ep_s = phase3_stats[tname].get("ep_shaping", [])
             if not ep_e:
                 continue
-            x   = np.arange(len(ep_e))
-            col = _c(i)
-            w   = max(1, min(50, len(ep_e) // 5))
+            col  = _c(i)
+            w    = max(1, min(50, len(ep_e) // 5))
             sm_e = np.convolve(ep_e, np.ones(w) / w, mode="valid")
             sm_s = np.convolve(ep_s, np.ones(w) / w, mode="valid")
             xs   = np.arange(w - 1, len(ep_e))
@@ -673,7 +668,6 @@ def plot_phase3_results(
                     linestyle="-",  label=f"{tname} env")
             ax.plot(xs, sm_s, color=col, linewidth=1.2,
                     linestyle="--", alpha=0.7, label=f"{tname} shaping")
-        ax.set_title("Env reward vs shaping bonus (smoothed)")
         ax.set_xlabel("episode")
         ax.set_ylabel("cumulative reward / ep")
         ax.legend(fontsize=6, loc="lower right", ncol=2)
@@ -681,24 +675,24 @@ def plot_phase3_results(
     else:
         ax.text(0.5, 0.5, "No shaping active\n(potential=None)",
                 ha="center", va="center", transform=ax.transAxes, fontsize=10)
-        ax.set_title("Env reward vs shaping bonus")
+    fig.tight_layout()
+    _save_fig(fig, f"{prefix}_reward_split.png")
 
-    # ── Panel 3: final success rate + avg return (last 20 ep) ─────────────
-    ax = axes[2]
-    succ_rates = []
-    avg_rets   = []
+    # ── File 3: final success rate + avg return (last 20 ep) ──────────────
+    succ_rates, avg_rets = [], []
     for tname in tasks:
         ep_s = phase3_stats[tname]["ep_successes"]
         ep_r = phase3_stats[tname]["ep_rewards"]
         succ_rates.append(float(np.mean(ep_s[-20:])) if ep_s else 0.0)
         avg_rets.append(float(np.mean(ep_r[-20:])) if ep_r else 0.0)
 
+    fig, ax = plt.subplots(figsize=(max(4, n * 1.5), 4))
     x    = np.arange(n)
-    w    = 0.35
+    bw   = 0.35
     cols = [_c(i) for i in range(n)]
-    ax.bar(x - w / 2, succ_rates, w, color=cols, alpha=0.85)
+    ax.bar(x - bw / 2, succ_rates, bw, color=cols, alpha=0.85)
     ax2 = ax.twinx()
-    ax2.bar(x + w / 2, avg_rets, w, color=cols, alpha=0.45, hatch="//")
+    ax2.bar(x + bw / 2, avg_rets, bw, color=cols, alpha=0.45, hatch="//")
     ax.set_xticks(x)
     ax.set_xticklabels([t.replace("-", "\n") for t in tasks], fontsize=8)
     ax.set_ylim(0, 1.1)
@@ -706,20 +700,14 @@ def plot_phase3_results(
     ax.tick_params(axis="y", labelcolor=_P["blue"])
     ax2.set_ylabel("avg shaped return (last 20 ep)", color=_P["gold"])
     ax2.tick_params(axis="y", labelcolor=_P["gold"])
-    ax.set_title("Task policy final performance")
     ax.grid(axis="y", alpha=0.3)
     leg = [mpatches.Patch(facecolor=_P["mid"], alpha=0.85, label="success rate"),
            mpatches.Patch(facecolor=_P["mid"], alpha=0.45, hatch="//",
                           label="avg shaped return")]
     ax.legend(handles=leg, fontsize=7, loc="upper right")
-
-    fig.suptitle(f"Phase 3 — Task Policy Training  (iteration {iteration})",
-                 fontsize=11, y=1.01)
     fig.tight_layout()
-    out = os.path.join(save_dir, f"phase3_iter_{iteration:03d}.png")
-    fig.savefig(out, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [Viz] Phase 3 results → {out}")
+    _save_fig(fig, f"{prefix}_final_perf.png")
+    print(f"  [Viz] Phase 3 results → {prefix}_*.png")
 
 
 # ── Per-iteration topology snapshot ───────────────────────────────────────

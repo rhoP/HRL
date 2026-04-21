@@ -506,7 +506,7 @@ def main(
     gamma: float              = 0.99,
     shaping_scale: float      = 1.0,
     subgoal_threshold: float  = float("inf"),
-    phase2_method: str        = "skeleton",
+    potential_alpha: float    = 0.5,
     meta_epochs: int          = 200,
     episodes_per_update: int  = 3,
     entropy_coef: float       = 0.01,
@@ -565,6 +565,7 @@ def main(
                                      state_dim=STATE_DIM, action_dim=ACTION_DIM,
                                      num_landmarks=num_landmarks,
                                      device=device, verbose=verbose)
+    skeleton["_potential_stale"] = True
     metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
     n_sub = len(skeleton["critical_states"])
     if verbose:
@@ -587,6 +588,7 @@ def main(
     meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True).to(device)
     meta_value_net = None
     task_policies  = {}
+    training_state = None
 
     for iteration in range(num_iterations):
         if verbose:
@@ -594,13 +596,13 @@ def main(
             print(f"Iteration {iteration + 1}/{num_iterations}")
             print(f"{'─'*60}")
 
-        # Phase 2 — build potential function
+        # Phase 2 — combined potential (skeleton + empirical, normalised)
         if verbose:
-            print(f"[Phase 2] Building {phase2_method} potential...")
+            print(f"[Phase 2] Building combined potential (α={potential_alpha:.2f})...")
         potential = phase2_build_potential(
             skeleton,
-            replay_buffer=rb if phase2_method == "empirical" else None,
-            method=phase2_method,
+            replay_buffer=rb,
+            alpha=potential_alpha,
             gamma=gamma,
             verbose=verbose,
         )
@@ -626,7 +628,7 @@ def main(
             print("[Phase 4] Training meta-policy via policy gradient...")
         training_skeleton = dict(skeleton)
         training_skeleton["skeleton_potential"] = potential
-        meta_policy, meta_value_net, p4_losses = \
+        meta_policy, meta_value_net, p4_losses, training_state = \
             meta_policy_gradient_with_skeleton_shaping(
                 meta_policy, task_distribution, training_skeleton,
                 meta_epochs=meta_epochs,
@@ -639,6 +641,7 @@ def main(
                 shaping_scale=shaping_scale,
                 subgoal_threshold=subgoal_threshold,
                 device=device, verbose=verbose,
+                training_state=training_state,
             )
         metrics["phase4_returns"].append(p4_losses)
 
@@ -709,6 +712,9 @@ def main(
             skeleton = refine_skeleton(skeleton, rb,
                                        num_landmarks=num_landmarks,
                                        device=device, verbose=verbose)
+            skeleton["_potential_stale"] = True
+            if training_state is not None:
+                training_state["is_buffer"] = None
             metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
             n_sub = len(skeleton["critical_states"])
             if verbose:
@@ -754,9 +760,9 @@ if __name__ == "__main__":
     parser.add_argument("--tasks",        nargs="+", default=list(TASK_CONFIGS.keys()),
                         choices=list(TASK_CONFIGS.keys()),
                         help="Task keys (default: A B C)")
-    parser.add_argument("--iterations",   type=int, default=5)
-    parser.add_argument("--landmarks",    type=int, default=16)
-    parser.add_argument("--meta-epochs",         type=int, default=200)
+    parser.add_argument("--iterations",   type=int, default=3)
+    parser.add_argument("--landmarks",    type=int, default=200)
+    parser.add_argument("--meta-epochs",         type=int, default=5)
     parser.add_argument("--episodes-per-update", type=int, default=3,
                         help="Episodes collected per gradient update in Phase 4 (default: 3)")
     parser.add_argument("--entropy-coef", type=float, default=0.01,
@@ -771,9 +777,8 @@ if __name__ == "__main__":
                         help="Potential shaping scale")
     parser.add_argument("--subgoal-threshold", type=float, default=float("inf"),
                         help="Distance threshold for sparse shaping (inf = always shape)")
-    parser.add_argument("--phase2-method", default="skeleton",
-                        choices=["skeleton", "empirical"],
-                        help="Phase 2 potential method")
+    parser.add_argument("--potential-alpha", type=float, default=0.5,
+                        help="α for combined potential: α·skeleton + (1−α)·empirical (default: 0.5)")
     parser.add_argument("--timesteps",    type=int,   default=15_000,
                         help="PPO timesteps per task in Phase 0")
     parser.add_argument("--eval-episodes", type=int, default=20)
@@ -806,7 +811,7 @@ if __name__ == "__main__":
             gamma=0.99,
             shaping_scale=args.shaping_scale,
             subgoal_threshold=args.subgoal_threshold,
-            phase2_method=args.phase2_method,
+            potential_alpha=args.potential_alpha,
             meta_epochs=args.meta_epochs,
             episodes_per_update=args.episodes_per_update,
             entropy_coef=args.entropy_coef,

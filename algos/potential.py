@@ -172,6 +172,67 @@ class EmpiricalHittingTimePotential:
         return self.get_potential(s_next, sg_id) - self.get_potential(s, sg_id)
 
 
+# ── Combined potential ────────────────────────────────────────────────────
+
+class CombinedPotential:
+    """
+    Φ(s; c) = α · Φ̃_skel(s; c)  +  (1−α) · Φ̃_emp(s; c)
+
+    Each component is normalised to unit standard deviation over a sample of
+    (landmark, subgoal) evaluations before mixing, making the convex combination
+    scale-invariant regardless of the magnitude difference between hop-count
+    distances and discounted returns.
+
+    α = 1.0  →  pure graph topology (SkeletonPotential)
+    α = 0.0  →  pure empirical hitting-time returns (EmpiricalHittingTimePotential)
+
+    When the empirical component has no hitting trajectories yet (empty buffer),
+    its std is 0 → scale falls back to 1.0 and all empirical values are 0, so
+    the combined potential degrades gracefully to the pure skeleton signal.
+    """
+
+    def __init__(
+        self,
+        skeleton_potential,
+        empirical_potential,
+        landmarks:  np.ndarray,
+        alpha: float = 0.5,
+    ):
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+        self.subgoals = skeleton_potential.subgoals
+        self._skel    = skeleton_potential
+        self._emp     = empirical_potential
+        self.alpha    = alpha
+
+        self._skel_scale = self._estimate_scale(skeleton_potential, landmarks)
+        self._emp_scale  = self._estimate_scale(empirical_potential, landmarks)
+
+    @staticmethod
+    def _estimate_scale(pot, landmarks: np.ndarray) -> float:
+        """Std of get_potential over up to 50 landmarks × all subgoals."""
+        if landmarks is None or len(landmarks) == 0 or not pot.subgoals:
+            return 1.0
+        lm_sample = landmarks[: min(len(landmarks), 50)]
+        vals = [
+            pot.get_potential(lm, sg_id)
+            for sg_id in pot.subgoals
+            for lm in lm_sample
+        ]
+        if len(vals) < 2:
+            return 1.0
+        std = float(np.std(vals))
+        return std if std > 1e-8 else 1.0
+
+    def get_potential(self, s, sg_id) -> float:
+        skel = self._skel.get_potential(s, sg_id) / self._skel_scale
+        emp  = self._emp.get_potential(s, sg_id)  / self._emp_scale
+        return self.alpha * skel + (1.0 - self.alpha) * emp
+
+    def get_intrinsic_reward(self, s, s_next, sg_id) -> float:
+        return self.get_potential(s_next, sg_id) - self.get_potential(s, sg_id)
+
+
 # ── k-NN backward estimator (for Morse function) ──────────────────────────
 
 class KNNBackwardEstimator:

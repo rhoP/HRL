@@ -212,7 +212,8 @@ def restore_models(ckpt: dict, state_dim: int, action_dim: int,
                                  discrete=discrete).to(device)
         meta_policy.load_state_dict(ckpt["meta_policy_state"])
         meta_policy.eval()
-        meta_value_net = MetaValueNetwork(state_dim).to(device)
+        meta_value_net = MetaValueNetwork(state_dim,
+                                          meta_policy.gru_hidden).to(device)
         meta_value_net.load_state_dict(ckpt["meta_value_net_state"])
         meta_value_net.eval()
 
