@@ -31,27 +31,27 @@ from utils.checkpoint    import (save_checkpoint, load_checkpoint,
                                   restore_models, BestModelTracker,
                                   save_replay_buffer, load_replay_buffer)
 from utils.viz           import (plot_training_curves, plot_skeleton_topology,
-                                  save_iteration_visuals)
+                                  save_iteration_visuals,
+                                  Phase3TrainingCallback, plot_phase3_results)
 from utils.skeleton      import build_skeleton, refine_skeleton
 
-# Import shared pipeline phases from MetaPolicy
+from models.meta_policy_net import MetaPolicy
 from algos.MetaPolicy import (
-    SubPolicy, MetaPolicy, MetaValueNetwork,
-    phase1_build_skeleton, phase2_train_value_net,
-    phase3_train_sub_policies, phase4_train_meta_policy,
-    collect_with_meta_policy, check_sub_policy_convergence,
+    phase1_build_skeleton, phase2_build_potential,
+    ShapedRewardWrapper,
 )
+from algos.meta_policy_gradient import meta_policy_gradient_with_skeleton_shaping
 
 STATE_DIM  = 4
 ACTION_DIM = 4   # discrete; stored as int but dim=4 for one-hot consistency
 
 TASK_CONFIGS = {
     "A": {"start": (1, 1), "goal": (9, 9)},
- #   "B": {"start": (9, 1), "goal": (1, 9)},
- #   "C": {"start": (1, 1), "goal": (9, 1)},
- #   "D": {"start": (1, 9), "goal": (9, 9)},
+    "B": {"start": (9, 1), "goal": (1, 9)},
+    "C": {"start": (1, 1), "goal": (9, 1)},
+    "D": {"start": (1, 9), "goal": (9, 9)},
 }
-TASK_IDS = {"A": 0,} #"B": 1, "C": 2, "D": 3}
+TASK_IDS = {"A": 0, "B": 1, "C": 2, "D": 3}
 
 
 # ── Environment ────────────────────────────────────────────────────────────
@@ -68,12 +68,15 @@ class FourRoomsEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, task_key: str = "A", grid_size: int = 11, noise: float = 0.1):
+    def __init__(self, task_key: str = "A", grid_size: int = 11, noise: float = 0.1,
+                 max_steps: int = 200):
         super().__init__()
-        self.task_key  = task_key
-        self.grid_size = grid_size
-        self.center    = grid_size // 2
-        self.noise     = noise
+        self.task_key   = task_key
+        self.grid_size  = grid_size
+        self.center     = grid_size // 2
+        self.noise      = noise
+        self._max_steps  = max_steps
+        self._step_count = 0
 
         self.observation_space = spaces.Box(
             low=0.0, high=float(grid_size - 1),
@@ -88,8 +91,9 @@ class FourRoomsEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.agent_pos = np.array(self._config["start"], dtype=np.float32)
-        self.goal_pos  = np.array(self._config["goal"],  dtype=np.float32)
+        self.agent_pos   = np.array(self._config["start"], dtype=np.float32)
+        self.goal_pos    = np.array(self._config["goal"],  dtype=np.float32)
+        self._step_count = 0
         return self._obs(), {}
 
     def step(self, action):
@@ -97,7 +101,6 @@ class FourRoomsEnv(gym.Env):
         move = self._moves[action].copy()
 
         if np.random.random() < self.noise:
-            # Swap dx/dy to create perpendicular noise
             move = move[::-1].copy()
 
         new_pos = self.agent_pos + move
@@ -105,11 +108,13 @@ class FourRoomsEnv(gym.Env):
         if self._is_valid(self.agent_pos, new_pos):
             self.agent_pos = new_pos
 
-        dist    = np.linalg.norm(self.agent_pos - self.goal_pos)
-        success = dist < 0.5
-        reward  = 10.0 if success else -0.1
+        self._step_count += 1
+        dist      = np.linalg.norm(self.agent_pos - self.goal_pos)
+        success   = dist < 0.5
+        reward    = 10.0 if success else -0.1
+        truncated = (not success) and self._step_count >= self._max_steps
 
-        return self._obs(), reward, success, False, {"success": float(success)}
+        return self._obs(), reward, success, truncated, {"success": float(success)}
 
     def _obs(self):
         return np.concatenate([self.agent_pos, self.goal_pos]).astype(np.float32)
@@ -122,12 +127,10 @@ class FourRoomsEnv(gym.Env):
         if x < 0 or x >= gs or y < 0 or y >= gs:
             return False
 
-        # Crossing from above-center to center-or-below
         if old_pos[1] < c and y >= c:
             if int(round(x)) != c:
                 return False
 
-        # Crossing from below-center to center-or-above
         if old_pos[1] > c and y <= c:
             if int(round(x)) != c:
                 return False
@@ -181,10 +184,13 @@ def phase0_collect(
         obs = vec_env.reset()
         for _ in range(timesteps_per_task):
             action, _ = model.predict(obs, deterministic=False)
-            obs_next, reward, done, _ = vec_env.step(action)
+            obs_next, reward, done, info = vec_env.step(action)
+            truncated  = info[0].get("TimeLimit.truncated", False)
+            terminated = bool(done[0]) and not truncated
             replay_buffer.push(
                 obs[0], action[0], float(reward[0]),
                 obs_next[0], bool(done[0]), task.id,
+                terminated=terminated,
             )
             obs = obs_next if not done[0] else vec_env.reset()
 
@@ -194,59 +200,115 @@ def phase0_collect(
         print(f"  [Phase 0] Buffer size: {len(replay_buffer)}")
 
 
+# ── Phase 3: Per-task policies with shaped rewards ─────────────────────────
+
+def phase3_train_task_policies(
+    skeleton_data: dict,
+    task_distribution: FourRoomsTaskDistribution,
+    potential=None,
+    timesteps_per_task: int = 10_000,
+    shaping_scale: float    = 1.0,
+    device: str             = "cpu",
+    verbose: bool           = True,
+    save_dir: str           = None,
+    iteration: int          = 0,
+) -> tuple:
+    """
+    Train one PPO policy per task with potential-based shaped rewards.
+
+    Returns (task_policies, phase3_stats) where:
+        task_policies — {task_id: PPO model}
+        phase3_stats  — {task_name: {"ep_rewards", "ep_env_rewards",
+                                     "ep_shaping", "ep_successes", "ep_lengths"}}
+    If save_dir is provided, saves phase3_iter_{N:03d}.png there.
+    """
+    task_policies: dict = {}
+    phase3_stats:  dict = {}
+
+    for task in task_distribution.tasks:
+        if verbose:
+            print(f"  [Phase 3] Training policy for {task.env_name} (task {task.id})...")
+
+        def _make_env(t=task, pot=potential, scale=shaping_scale):
+            env = t.create_env()
+            if pot is not None:
+                env = ShapedRewardWrapper(env, pot, shaping_scale=scale)
+            return env
+
+        cb      = Phase3TrainingCallback()
+        vec_env = make_vec_env(_make_env, n_envs=1)
+        model   = PPO("MlpPolicy", vec_env, verbose=0, device=device)
+        model.learn(total_timesteps=timesteps_per_task, callback=cb)
+        task_policies[task.id] = model
+        vec_env.close()
+
+        phase3_stats[task.env_name] = {
+            "ep_rewards":     cb.ep_rewards,
+            "ep_env_rewards": cb.ep_env_rewards,
+            "ep_shaping":     cb.ep_shaping,
+            "ep_successes":   cb.ep_successes,
+            "ep_lengths":     cb.ep_lengths,
+        }
+        if verbose and cb.ep_rewards:
+            last20 = cb.ep_rewards[-20:]
+            sr     = float(np.mean(cb.ep_successes[-20:])) if cb.ep_successes else 0.0
+            print(f"    last-20-ep: avg_shaped_r={np.mean(last20):.3f}  "
+                  f"success_rate={sr:.1%}")
+
+    if save_dir is not None:
+        plot_phase3_results(phase3_stats, save_dir, iteration=iteration)
+
+    if verbose:
+        print(f"  [Phase 3] Trained {len(task_policies)} task policy/ies.")
+    return task_policies, phase3_stats
+
+
 # ── Evaluation ─────────────────────────────────────────────────────────────
 
 def evaluate_policy(
     meta_policy,
-    sub_policies: dict,
-    skeleton_data: dict,
     task_distribution: FourRoomsTaskDistribution,
     n_episodes: int = 20,
     max_steps: int  = 200,
     gamma: float    = 0.99,
     device: str     = "cpu",
 ) -> dict:
-    c_list    = list(skeleton_data["critical_states"].keys())
-    successes = []
-    returns   = []
+    meta_policy.eval()
+    successes: list = []
+    returns:   list = []
     env_results: dict = {}
 
     for _ in range(n_episodes):
-        task = task_distribution.sample()
-        env  = task.create_env()
-        obs, _ = env.reset()
-        obs  = torch.tensor(obs, dtype=torch.float32, device=device)
-
-        done      = False
+        task   = task_distribution.sample()
+        env    = task.create_env()
+        result = env.reset()
+        s      = result[0] if isinstance(result, tuple) else result
+        tau    = []
+        done   = False
         ep_return = 0.0
-        t         = 0
-        success   = False
+        t      = 0
+        success = False
 
         while not done and t < max_steps:
             with torch.no_grad():
-                c_idx = meta_policy(obs).sample().item()
-            c_id = c_list[c_idx]
-            sp   = sub_policies.get(c_id)
-            T_c  = 0
-
-            while sp is not None and not sp.is_terminated(obs, done, T_c):
-                with torch.no_grad():
-                    a    = sp.get_action(obs)
-                a_np = int(a.cpu().numpy()) if a.numel() == 1 else a.cpu().numpy()
-                obs_next, r, terminated, truncated, info = env.step(a_np)
-                done    = terminated or truncated
-                success = success or bool(info.get("success", 0.0) > 0.5)
-                ep_return += (gamma ** t) * r
-                obs  = torch.tensor(obs_next, dtype=torch.float32, device=device)
-                t += 1; T_c += 1
-                if done or t >= max_steps:
-                    break
+                a_dist = meta_policy(s, tau)
+                a      = a_dist.sample()
+            a_np  = a.cpu().numpy().flatten()
+            a_env = int(a_np[0]) if meta_policy.discrete else a_np
+            s_next, r, terminated, truncated, info = env.step(a_env)
+            done    = terminated or truncated
+            success = success or bool(info.get("success", 0.0) > 0.5)
+            ep_return += (gamma ** t) * r
+            tau.append((np.asarray(s, dtype=np.float32), a_np, r))
+            s = s_next
+            t += 1
 
         env.close()
         successes.append(float(success))
         returns.append(ep_return)
         env_results.setdefault(task.env_name, []).append(float(success))
 
+    meta_policy.train()
     per_env = {k: float(np.mean(v)) for k, v in env_results.items()}
     return {
         "success_rate": float(np.mean(successes)),
@@ -259,7 +321,6 @@ def evaluate_policy(
 
 def run_demos(
     meta_policy,
-    sub_policies: dict,
     skeleton_data: dict,
     task_distribution: FourRoomsTaskDistribution,
     save_dir: str,
@@ -269,8 +330,7 @@ def run_demos(
     device: str    = "cpu",
 ) -> list:
     """
-    Run demo episodes and save per-episode grid renders (PNG) and a
-    JSON summary. No video rendering required.
+    Run demo episodes with the GRU meta-policy and save grid renders + JSON summary.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -278,66 +338,58 @@ def run_demos(
     from sklearn.decomposition import PCA
 
     os.makedirs(save_dir, exist_ok=True)
-    c_list   = list(skeleton_data["critical_states"].keys())
+    c_states = [np.asarray(v, dtype=np.float32)
+                for v in skeleton_data["critical_states"].values()]
     lm_np    = skeleton_data["landmarks"].cpu().numpy()
     D        = lm_np.shape[1]
     pca      = PCA(n_components=2).fit(lm_np) if D > 2 else None
-    proj     = lambda s: pca.transform(s.reshape(1, -1))[0] if pca else s[:2]
+    proj     = lambda s: pca.transform(np.asarray(s).reshape(1, -1))[0] if pca else np.asarray(s)[:2]
     lm_2d    = pca.transform(lm_np) if pca else lm_np[:, :2]
-    crit_ids = list(skeleton_data["critical_states"].keys())
-    crit_2d  = lm_2d[crit_ids] if crit_ids else np.empty((0, 2))
+    crit_2d  = (pca.transform(np.stack(c_states)) if (pca and c_states)
+                else (np.stack(c_states)[:, :2] if c_states else np.empty((0, 2))))
     cmap     = plt.get_cmap("tab10")
 
+    meta_policy.eval()
     results = []
     for demo_i in range(n_demos):
         task   = task_distribution.sample()
         env    = task.create_env()
-        obs, _ = env.reset()
-        obs_t  = torch.tensor(obs, dtype=torch.float32, device=device)
-
-        traj_pts    = [proj(obs)]
-        sg_sequence = []
-        ep_return   = 0.0
-        t           = 0
-        done        = False
-        success     = False
+        result = env.reset()
+        s      = result[0] if isinstance(result, tuple) else result
+        s_arr  = np.asarray(s, dtype=np.float32).flatten()
+        tau    = []
+        traj_pts = [proj(s_arr)]
+        ep_return = 0.0
+        t     = 0
+        done  = False
+        success = False
 
         while not done and t < max_steps:
             with torch.no_grad():
-                c_idx = meta_policy(obs_t).sample().item()
-            c_id = c_list[c_idx]
-            sp   = sub_policies.get(c_id)
-            sg_sequence.append(int(c_id))
-            T_c  = 0
-
-            while sp is not None and not sp.is_terminated(obs_t, done, T_c):
-                with torch.no_grad():
-                    a = sp.get_action(obs_t)
-                a_np = int(a.cpu().numpy()) if a.numel() == 1 else a.cpu().numpy()
-                obs_next, r, terminated, truncated, info = env.step(a_np)
-                done    = terminated or truncated
-                success = success or bool(info.get("success", 0.0) > 0.5)
-                ep_return += (gamma ** t) * r
-                traj_pts.append(proj(obs_next))
-                obs_t = torch.tensor(obs_next, dtype=torch.float32, device=device)
-                t += 1; T_c += 1
-                if done or t >= max_steps:
-                    break
+                a_dist = meta_policy(s_arr, tau)
+                a      = a_dist.sample()
+            a_np  = a.cpu().numpy().flatten()
+            a_env = int(a_np[0]) if meta_policy.discrete else a_np
+            s_next, r, terminated, truncated, info = env.step(a_env)
+            done    = terminated or truncated
+            success = success or bool(info.get("success", 0.0) > 0.5)
+            ep_return += (gamma ** t) * r
+            tau.append((s_arr, a_np, r))
+            s_arr = np.asarray(s_next, dtype=np.float32).flatten()
+            traj_pts.append(proj(s_arr))
+            t += 1
 
         env.close()
-
-        result = {
+        result_d = {
             "demo": demo_i, "task": task.env_name,
             "success": success, "return": ep_return, "steps": t,
-            "subgoals": sg_sequence,
         }
-        results.append(result)
+        results.append(result_d)
 
-        # Grid plot
         traj = np.array(traj_pts)
         fig, axes = plt.subplots(1, 2, figsize=(11, 5))
 
-        # Left: actual grid positions
+        # Left: grid trajectory
         ax = axes[0]
         grid_size = env.grid_size if hasattr(env, "grid_size") else 11
         ax.set_xlim(-0.5, grid_size - 0.5)
@@ -345,17 +397,14 @@ def run_demos(
         ax.set_aspect("equal")
         ax.set_title(f"Grid trajectory — {task.env_name}")
         c = grid_size // 2
-        # Draw walls
         ax.plot([c - 0.5, c - 0.5], [-0.5, c - 0.5], "k-", lw=2)
         ax.plot([c - 0.5, c - 0.5], [c + 0.5, grid_size - 0.5], "k-", lw=2)
         ax.plot([c + 0.5, c + 0.5], [-0.5, c - 0.5], "k-", lw=2)
         ax.plot([c + 0.5, c + 0.5], [c + 0.5, grid_size - 0.5], "k-", lw=2)
-        # Trajectory coloured by active subgoal
         for k in range(len(traj_pts) - 1):
-            sg_frac = sg_sequence[min(k, len(sg_sequence) - 1)] if sg_sequence else 0
-            ax.plot([traj_pts[k][0], traj_pts[k + 1][0]],
-                    [traj_pts[k][1], traj_pts[k + 1][1]],
-                    color=cmap(sg_frac % 10), lw=1.2, alpha=0.8)
+            ax.plot([traj_pts[k][0], traj_pts[k+1][0]],
+                    [traj_pts[k][1], traj_pts[k+1][1]],
+                    color=cmap(k % 10), lw=1.2, alpha=0.8)
         ax.plot(*traj_pts[0][:2],  "g^", ms=10, label="start", zorder=5)
         ax.plot(*traj_pts[-1][:2], "*",
                 color="gold" if success else "red", ms=12,
@@ -385,6 +434,7 @@ def run_demos(
         print(f"  [Demo {demo_i}] {task.env_name}  {status}  "
               f"return={ep_return:.3f}  steps={t}")
 
+    meta_policy.train()
     with open(os.path.join(save_dir, "demo_summary.json"), "w") as f:
         json.dump(results, f, indent=2)
     print(f"  [Demo] success_rate={np.mean([r['success'] for r in results]):.1%}")
@@ -395,19 +445,26 @@ def run_demos(
 
 def main(
     task_distribution: FourRoomsTaskDistribution = None,
-    num_landmarks: int      = 16,
-    num_iterations: int     = 5,
-    refine_every: int       = 2,
-    timesteps_per_task: int = 10_000,
-    collect_episodes: int   = 50,
-    gamma: float            = 0.99,
-    sub_epochs: int         = 50,
-    meta_epochs: int        = 200,
-    eval_episodes: int      = 20,
-    n_demos: int            = 5,
-    save_dir: str           = "results/four_rooms",
-    device: str             = "cpu",
-    verbose: bool           = True,
+    num_landmarks: int        = 16,
+    num_iterations: int       = 5,
+    refine_every: int         = 2,
+    timesteps_per_task: int   = 10_000,
+    task_steps: int           = 10_000,
+    collect_episodes: int     = 50,
+    gamma: float              = 0.99,
+    shaping_scale: float      = 1.0,
+    subgoal_threshold: float  = float("inf"),
+    phase2_method: str        = "skeleton",
+    meta_epochs: int          = 200,
+    episodes_per_update: int  = 4,
+    entropy_coef: float       = 0.01,
+    is_buffer_size: int       = 16,
+    is_clip_epsilon: float    = 0.2,
+    eval_episodes: int        = 20,
+    n_demos: int              = 5,
+    save_dir: str             = "results/four_rooms",
+    device: str               = "cpu",
+    verbose: bool             = True,
 ):
     if task_distribution is None:
         task_distribution = FourRoomsTaskDistribution()
@@ -424,9 +481,7 @@ def main(
 
     metrics = {
         "skeleton_train_losses": [],
-        "phase2_losses":         [],
-        "phase3_pi_losses":      [],
-        "phase3_v_losses":       [],
+        "phase3_success_rates":  [],
         "phase4_returns":        [],
         "eval_success_rates":    [],
         "eval_returns":          [],
@@ -454,12 +509,20 @@ def main(
     # Phase 1
     if verbose:
         print("\n[Phase 1] Building Morse skeleton...")
-    skeleton = phase1_build_skeleton(rb, num_landmarks=num_landmarks,
+    skeleton = phase1_build_skeleton(rb,
+                                     state_dim=STATE_DIM, action_dim=ACTION_DIM,
+                                     num_landmarks=num_landmarks,
                                      device=device, verbose=verbose)
     metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
     n_sub = len(skeleton["critical_states"])
     if verbose:
         print(f"  Found {n_sub} critical state(s).")
+        knn_est = skeleton.get("knn_estimator")
+        if knn_est is not None:
+            for tid, s in knn_est.back_ret_stats().items():
+                flag = "  ← FLAT phi" if s["std"] < 0.01 else ""
+                print(f"  [KNN] task {tid}: n={s['n']:5d}  "
+                      f"back_ret mean={s['mean']:+.4f}  std={s['std']:.4f}{flag}")
 
     plot_skeleton_topology(skeleton, rb,
                            os.path.join(save_dir, "topology_initial.png"))
@@ -469,11 +532,9 @@ def main(
         plot_training_curves(metrics, save_dir)
         return None, None, skeleton, metrics
 
-    meta_policy    = None
+    meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True).to(device)
     meta_value_net = None
-    sub_policies   = {}
-    hitting_nets   = {}
-    sp_converged   = True   # run Phase 2 on first iteration
+    task_policies  = {}
 
     for iteration in range(num_iterations):
         if verbose:
@@ -481,62 +542,57 @@ def main(
             print(f"Iteration {iteration + 1}/{num_iterations}")
             print(f"{'─'*60}")
 
-        # Phase 2 — only re-train V_H when sub-policies have converged
-        if sp_converged or not hitting_nets:
-            if verbose:
-                reason = "first iteration" if not hitting_nets else "sub-policies converged"
-                print(f"[Phase 2] Training hitting-time value nets ({reason})...")
-            hitting_nets, p2_losses = phase2_train_value_net(
-                skeleton, rb, gamma=gamma, device=device, verbose=verbose,
-            )
-            for net in hitting_nets.values():
-                net.requires_grad_(False)
-            metrics["phase2_losses"].append(p2_losses)
-            sp_converged = False
-        else:
-            if verbose:
-                print("[Phase 2] Skipping — V_H frozen until sub-policies converge.")
-            metrics["phase2_losses"].append([])
-
-        # Phase 3 — discrete actions
-        sub_policies, p3_pi, p3_v = phase3_train_sub_policies(
-            skeleton, rb, hitting_nets,
-            task_distribution=task_distribution,
-            state_dim=STATE_DIM, action_dim=ACTION_DIM,
-            discrete=True,
-            gamma=gamma, epochs=sub_epochs,
-            reach_threshold=1.0,
-            device=device, verbose=verbose,
-            existing_sub_policies=sub_policies,
-            carry_over_policies=True,
-        )
-        metrics["phase3_pi_losses"].append(p3_pi)
-        metrics["phase3_v_losses"].append(p3_v)
-
-        sp_converged = check_sub_policy_convergence(
-            sub_policies, task_distribution, device=device,
-        )
+        # Phase 2 — build potential function
         if verbose:
-            print(f"  Sub-policy convergence: "
-                  f"{'converged' if sp_converged else 'not yet — V_H stays frozen'}")
-
-        # Phase 4
-        meta_policy, meta_value_net, p4_returns = phase4_train_meta_policy(
-            sub_policies, skeleton, task_distribution,
-            state_dim=STATE_DIM, gamma=gamma,
-            meta_epochs=meta_epochs,
-            total_iterations=num_iterations,
-            current_iteration=iteration,
-            device=device, verbose=verbose,
+            print(f"[Phase 2] Building {phase2_method} potential...")
+        potential = phase2_build_potential(
+            skeleton,
+            replay_buffer=rb if phase2_method == "empirical" else None,
+            method=phase2_method,
+            gamma=gamma,
+            verbose=verbose,
         )
-        metrics["phase4_returns"].append(p4_returns)
 
-        if meta_policy is None:
-            continue
+        # Phase 3 — one PPO policy per task with shaped rewards
+        if verbose:
+            print("[Phase 3] Training task policies with shaped rewards...")
+        task_policies, p3_stats = phase3_train_task_policies(
+            skeleton, task_distribution,
+            potential=potential,
+            timesteps_per_task=task_steps,
+            shaping_scale=shaping_scale,
+            device=device, verbose=verbose,
+            save_dir=save_dir, iteration=iteration,
+        )
+        p3_sr = float(np.mean([np.mean(v["ep_successes"][-20:])
+                                for v in p3_stats.values()
+                                if v["ep_successes"]]) if p3_stats else 0.0)
+        metrics["phase3_success_rates"].append(p3_sr)
+
+        # Phase 4 — meta-policy gradient with skeleton shaping
+        if verbose:
+            print("[Phase 4] Training meta-policy via policy gradient...")
+        training_skeleton = dict(skeleton)
+        training_skeleton["skeleton_potential"] = potential
+        meta_policy, meta_value_net, p4_losses = \
+            meta_policy_gradient_with_skeleton_shaping(
+                meta_policy, task_distribution, training_skeleton,
+                meta_epochs=meta_epochs,
+                episodes_per_update=episodes_per_update,
+                entropy_coef=entropy_coef,
+                is_buffer_size=is_buffer_size,
+                is_clip_epsilon=is_clip_epsilon,
+                replay_buffer=rb,
+                gamma=gamma,
+                shaping_scale=shaping_scale,
+                subgoal_threshold=subgoal_threshold,
+                device=device, verbose=verbose,
+            )
+        metrics["phase4_returns"].append(p4_losses)
 
         # Evaluate
         eval_result = evaluate_policy(
-            meta_policy, sub_policies, skeleton, task_distribution,
+            meta_policy, task_distribution,
             n_episodes=eval_episodes, gamma=gamma, device=device,
         )
         metrics["eval_success_rates"].append(eval_result["success_rate"])
@@ -551,11 +607,11 @@ def main(
         ckpt_dir = save_checkpoint(
             save_dir, iteration=iteration,
             meta_policy=meta_policy, meta_value_net=meta_value_net,
-            sub_policies=sub_policies, hitting_nets=hitting_nets,
+            task_policies=task_policies,
             skeleton_data=skeleton, replay_buffer=rb,
             metrics={
                 "eval": eval_result,
-                "p4_avg_return": float(np.mean(p4_returns)) if p4_returns else 0.0,
+                "p4_avg_return": float(np.mean(p4_losses)) if p4_losses else 0.0,
             },
         )
         improved = tracker.update(eval_result["success_rate"], ckpt_dir)
@@ -564,34 +620,31 @@ def main(
 
         save_iteration_visuals(skeleton, rb, metrics, save_dir, iteration)
 
-        # Collect more data with trained policy
-        # Re-use collect_with_meta_policy but handle discrete action conversion
-        c_list = list(skeleton["critical_states"].keys())
+        # Collect more data with trained meta-policy
+        meta_policy.eval()
         for _ in range(collect_episodes):
-            task   = task_distribution.sample()
-            env    = task.create_env()
-            obs, _ = env.reset()
-            obs_t  = torch.tensor(obs, dtype=torch.float32, device=device)
-            done   = False
+            task    = task_distribution.sample()
+            env     = task.create_env()
+            result  = env.reset()
+            obs_arr = np.asarray(result[0] if isinstance(result, tuple) else result,
+                                 dtype=np.float32).flatten()
+            tau  = []
+            done = False
             while not done:
                 with torch.no_grad():
-                    c_idx = meta_policy(obs_t).sample().item()
-                c_id = c_list[c_idx]
-                sp   = sub_policies.get(c_id)
-                T_c  = 0
-                while sp is not None and not sp.is_terminated(obs_t, done, T_c):
-                    with torch.no_grad():
-                        a = sp.get_action(obs_t)
-                    a_np = int(a.cpu().numpy()) if a.numel() == 1 else a.cpu().numpy()
-                    obs_next, r, terminated, truncated, _ = env.step(a_np)
-                    done = terminated or truncated
-                    rb.push(obs_t.cpu().numpy(), np.array([int(a_np)]),
-                            r, obs_next, done, task.id)
-                    obs_t = torch.tensor(obs_next, dtype=torch.float32, device=device)
-                    T_c += 1
-                    if done:
-                        break
+                    a_dist = meta_policy(obs_arr, tau)
+                    a      = a_dist.sample()
+                a_np  = a.cpu().numpy().flatten()
+                a_env = int(a_np[0]) if meta_policy.discrete else a_np
+                obs_next, r, terminated, truncated, _ = env.step(a_env)
+                done         = terminated or truncated
+                obs_next_arr = np.asarray(obs_next, dtype=np.float32).flatten()
+                rb.push(obs_arr, a_np, r, obs_next_arr, done, task.id,
+                        terminated=terminated)
+                tau.append((obs_arr, a_np, r))
+                obs_arr = obs_next_arr
             env.close()
+        meta_policy.train()
 
         save_replay_buffer(rb, rb_path)
         if verbose:
@@ -608,6 +661,12 @@ def main(
             n_sub = len(skeleton["critical_states"])
             if verbose:
                 print(f"  Refined skeleton: {n_sub} critical state(s).")
+                knn_est = skeleton.get("knn_estimator")
+                if knn_est is not None:
+                    for tid, s in knn_est.back_ret_stats().items():
+                        flag = "  ← FLAT phi" if s["std"] < 0.01 else ""
+                        print(f"  [KNN] task {tid}: n={s['n']:5d}  "
+                              f"back_ret mean={s['mean']:+.4f}  std={s['std']:.4f}{flag}")
             if n_sub == 0:
                 print("  No subgoals after refinement; stopping.")
                 break
@@ -621,10 +680,10 @@ def main(
             print(f"\n[Demo] Running {n_demos} demos with best model...")
         try:
             best_ckpt = load_checkpoint(best_dir, device=device)
-            demo_mp, _, demo_sp, _, demo_skel = restore_models(
-                best_ckpt, STATE_DIM, ACTION_DIM, device=device,
+            demo_mp, _, demo_tp, demo_skel = restore_models(
+                best_ckpt, STATE_DIM, ACTION_DIM, discrete=True, device=device,
             )
-            run_demos(demo_mp, demo_sp, demo_skel, task_distribution,
+            run_demos(demo_mp, demo_skel, task_distribution,
                       save_dir=os.path.join(save_dir, "demos"),
                       n_demos=n_demos, gamma=gamma, device=device)
         except Exception as e:
@@ -633,7 +692,7 @@ def main(
     if verbose:
         print("\nFour-Rooms pipeline complete.")
 
-    return meta_policy, sub_policies, skeleton, metrics
+    return meta_policy, task_policies, skeleton, metrics
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
@@ -643,11 +702,27 @@ if __name__ == "__main__":
     parser.add_argument("--tasks",        nargs="+", default=list(TASK_CONFIGS.keys()),
                         choices=list(TASK_CONFIGS.keys()),
                         help="Task keys to include (default: all A B C D)")
-    parser.add_argument("--iterations",   type=int, default=5)
+    parser.add_argument("--iterations",   type=int, default=2)
     parser.add_argument("--landmarks",    type=int, default=200)
-    parser.add_argument("--meta-epochs",  type=int, default=200)
-    parser.add_argument("--sub-epochs",   type=int, default=50)
-    parser.add_argument("--timesteps",    type=int, default=10_000,
+    parser.add_argument("--meta-epochs",        type=int, default=200)
+    parser.add_argument("--episodes-per-update", type=int, default=4,
+                        help="Episodes collected per gradient update in Phase 4 (default: 4)")
+    parser.add_argument("--entropy-coef", type=float, default=0.01,
+                        help="Entropy bonus coefficient for meta-policy loss (default: 0.01)")
+    parser.add_argument("--is-buffer-size", type=int, default=16,
+                        help="Number of recent episodes in IS trajectory buffer (default: 16)")
+    parser.add_argument("--is-clip-epsilon", type=float, default=0.2,
+                        help="PPO-style IS ratio clip epsilon (default: 0.2)")
+    parser.add_argument("--task-steps",   type=int, default=10_000,
+                        help="PPO timesteps per task in Phase 3")
+    parser.add_argument("--shaping-scale",     type=float, default=1.0,
+                        help="Potential shaping scale")
+    parser.add_argument("--subgoal-threshold", type=float, default=float("inf"),
+                        help="Distance threshold for sparse shaping (inf = always shape)")
+    parser.add_argument("--phase2-method", default="skeleton",
+                        choices=["skeleton", "empirical"],
+                        help="Phase 2 potential method")
+    parser.add_argument("--timesteps",    type=int,   default=10_000,
                         help="PPO timesteps per task in Phase 0")
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--n-demos",      type=int, default=5)
@@ -662,11 +737,11 @@ if __name__ == "__main__":
     if args.demo_only:
         if args.load is None:
             parser.error("--demo-only requires --load <checkpoint_dir>")
-        ckpt     = load_checkpoint(args.load, device=args.device)
-        mp, _, sp, _, skel = restore_models(
-            ckpt, STATE_DIM, ACTION_DIM, device=args.device,
+        ckpt = load_checkpoint(args.load, device=args.device)
+        mp, _, tp, skel = restore_models(
+            ckpt, STATE_DIM, ACTION_DIM, discrete=True, device=args.device,
         )
-        run_demos(mp, sp, skel, dist,
+        run_demos(mp, skel, dist,
                   save_dir=os.path.join(args.save_dir, "demos"),
                   n_demos=args.n_demos, device=args.device)
     else:
@@ -675,9 +750,16 @@ if __name__ == "__main__":
             num_landmarks=args.landmarks,
             num_iterations=args.iterations,
             timesteps_per_task=args.timesteps,
+            task_steps=args.task_steps,
             gamma=0.99,
-            sub_epochs=args.sub_epochs,
+            shaping_scale=args.shaping_scale,
+            subgoal_threshold=args.subgoal_threshold,
+            phase2_method=args.phase2_method,
             meta_epochs=args.meta_epochs,
+            episodes_per_update=args.episodes_per_update,
+            entropy_coef=args.entropy_coef,
+            is_buffer_size=args.is_buffer_size,
+            is_clip_epsilon=args.is_clip_epsilon,
             eval_episodes=args.eval_episodes,
             n_demos=args.n_demos,
             save_dir=args.save_dir,
