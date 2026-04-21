@@ -748,7 +748,7 @@ if __name__ == "__main__":
                         help="Distance threshold for sparse shaping (inf = always shape)")
     parser.add_argument("--potential-alpha", type=float, default=0.5,
                         help="α for combined potential: α·skeleton + (1−α)·empirical (default: 0.5)")
-    parser.add_argument("--timesteps",    type=int,   default=50_000,
+    parser.add_argument("--timesteps",    type=int,   default=20_000,
                         help="PPO timesteps per task in Phase 0")
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--n-demos",      type=int, default=5)

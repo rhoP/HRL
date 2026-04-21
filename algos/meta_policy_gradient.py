@@ -265,15 +265,16 @@ def meta_policy_gradient_with_skeleton_shaping(
     If `replay_buffer` is provided each collected transition (using raw env
     reward) is pushed to it, so Phase 1 skeleton data grows during training.
 
-    `training_state` carries {meta_value_net, optimizer, is_buffer} across
-    outer-loop iterations so Adam moments, baseline weights, and buffered
-    episodes are not thrown away between calls.  Pass None on the first call;
-    pass back the returned dict on subsequent calls.
+    `training_state` carries {meta_value_net, policy_optimizer,
+    value_optimizer, is_buffer} across outer-loop iterations so Adam moments,
+    baseline weights, and buffered episodes are not thrown away between calls.
+    Pass None on the first call; pass back the returned dict on subsequent calls.
 
     `flush_buffer` should be True whenever the shaped-reward potential has
     changed (i.e. every outer iteration), so that stale returns from the
     previous potential do not corrupt the IS correction.  It discards the
-    episode buffer and clears Adam's first/second moment accumulators.
+    episode buffer and resets only the value optimizer's Adam moments (the
+    return scale changed; the policy optimizer moments are preserved).
 
     Returns:
         meta_policy      — trained policy (same object, in-place)
@@ -293,22 +294,29 @@ def meta_policy_gradient_with_skeleton_shaping(
     meta_value_net = (ts.get("meta_value_net") or
                       MetaValueNetwork(state_dim, meta_policy.gru_hidden).to(device))
 
-    if ts.get("optimizer") is not None:
-        optimizer = ts["optimizer"]
+    if ts.get("policy_optimizer") is not None:
+        policy_optimizer = ts["policy_optimizer"]
     else:
-        optimizer = torch.optim.Adam(
-            list(meta_policy.parameters()) + list(meta_value_net.parameters()),
-            lr=lr,
-        )
+        policy_optimizer = torch.optim.Adam(meta_policy.parameters(), lr=lr)
+
+    if ts.get("value_optimizer") is not None:
+        value_optimizer = ts["value_optimizer"]
+    else:
+        value_optimizer = torch.optim.Adam(meta_value_net.parameters(), lr=lr)
 
     is_buffer = (ts.get("is_buffer") or
                  TrajectoryBuffer(max_episodes=is_buffer_size))
 
     if flush_buffer:
+        # Return distribution changed (new potential) — discard stale episodes
+        # and reset value optimizer moments so Adam doesn't overshoot.
+        # Policy optimizer moments are preserved (policy itself didn't reset).
         is_buffer = TrajectoryBuffer(max_episodes=is_buffer_size)
+        value_optimizer.state.clear()
 
     if flush_optimizer:
-        optimizer.state.clear()
+        policy_optimizer.state.clear()
+        value_optimizer.state.clear()
 
     epoch_losses = []
     meta_policy.train()
@@ -360,7 +368,9 @@ def meta_policy_gradient_with_skeleton_shaping(
             batch["states_t"], batch["hidden_states_t"]
         ).squeeze(-1)
         adv = batch["returns_t"] - values.detach()
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        adv_std = adv.std()
+        if adv_std > 1e-6:
+            adv = (adv - adv.mean()) / (adv_std + 1e-8)
 
         # IS ratio with PPO clipping
         log_ratio     = curr_lp - batch["log_probs_old_t"].detach()
@@ -372,11 +382,17 @@ def meta_policy_gradient_with_skeleton_shaping(
         entropy_loss = curr_ent.mean()
         total_loss   = policy_loss + 0.5 * value_loss - entropy_coef * entropy_loss
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(meta_policy.parameters(),    1.0)
+        # Separate backward passes: value and policy graphs are independent
+        # (adv uses values.detach()), so we can isolate their optimizers.
+        value_optimizer.zero_grad()
+        (0.5 * value_loss).backward()
         torch.nn.utils.clip_grad_norm_(meta_value_net.parameters(), 1.0)
-        optimizer.step()
+        value_optimizer.step()
+
+        policy_optimizer.zero_grad()
+        (policy_loss - entropy_coef * entropy_loss).backward()
+        torch.nn.utils.clip_grad_norm_(meta_policy.parameters(), 1.0)
+        policy_optimizer.step()
 
         epoch_losses.append({
             "total":   float(total_loss.item()),
@@ -406,7 +422,8 @@ def meta_policy_gradient_with_skeleton_shaping(
                   f"success_rate={sr:.1%}")
 
     return meta_policy, meta_value_net, epoch_losses, {
-        "meta_value_net": meta_value_net,
-        "optimizer":      optimizer,
-        "is_buffer":      is_buffer,
+        "meta_value_net":    meta_value_net,
+        "policy_optimizer":  policy_optimizer,
+        "value_optimizer":   value_optimizer,
+        "is_buffer":         is_buffer,
     }

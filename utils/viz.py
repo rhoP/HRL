@@ -246,8 +246,8 @@ def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
         ax.grid(alpha=0.25)
 
     n_iters = len([r for r in phase4_losses if r])
-    fig.suptitle(f"Meta-policy gradient losses  ({n_iters} iteration(s), "
-                 f"{n_epochs} total epochs)", fontsize=11)
+    #fig.suptitle(f"Meta-policy gradient losses  ({n_iters} iteration(s), "
+    #            f"{n_epochs} total epochs)", fontsize=11)
     fig.tight_layout()
     out = os.path.join(save_dir, "metrics_meta_loss.png")
     _save_fig(fig, out)
