@@ -23,6 +23,7 @@ import json
 import numpy as np
 import torch
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -31,6 +32,7 @@ from matplotlib.tri import Triangulation
 
 try:
     from stable_baselines3.common.callbacks import BaseCallback as _SB3BaseCallback
+
     _SB3_AVAILABLE = True
 except ImportError:
     _SB3_AVAILABLE = False
@@ -40,31 +42,32 @@ from matplotlib.colors import LinearSegmentedColormap
 
 # ── Palette ────────────────────────────────────────────────────────────────
 _P = {
-    "blue":  "#1B3B6F",
-    "red":   "#B0433F",
-    "gold":  "#C9A46C",
-    "plum":  "#2F1B2E",
-    "fill":  "#D8C4D6",
+    "blue": "#1B3B6F",
+    "red": "#B0433F",
+    "gold": "#C9A46C",
+    "plum": "#2F1B2E",
+    "fill": "#D8C4D6",
     "light": "#E6E6E6",
-    "mid":   "#66606B",
+    "mid": "#66606B",
 }
 _PALETTE_CYCLE = [_P["blue"], _P["red"], _P["gold"], _P["plum"]]
+
 
 def _c(i: int) -> str:
     """Return palette colour by index, cycling over the 4 primary hues."""
     return _PALETTE_CYCLE[i % 4]
+
 
 # Diverging: blue → lavender fill → red  (centred at 0; for Morse values)
 CMAP_DIV = LinearSegmentedColormap.from_list(
     "pal_div", [_P["blue"], _P["fill"], _P["red"]]
 )
 # Sequential: light grey → deep plum  (for Φ potential, low→high)
-CMAP_SEQ = LinearSegmentedColormap.from_list(
-    "pal_seq", [_P["light"], _P["plum"]]
-)
+CMAP_SEQ = LinearSegmentedColormap.from_list("pal_seq", [_P["light"], _P["plum"]])
 
 
 # ── Figure save helper ─────────────────────────────────────────────────────
+
 
 def _save_fig(fig, path: str) -> None:
     """Save figure as PNG; also write .tex via tikzplotlib or .pgf as fallback."""
@@ -72,8 +75,10 @@ def _save_fig(fig, path: str) -> None:
     stem = os.path.splitext(path)[0]
     try:
         import tikzplotlib
-        tikzplotlib.save(stem + ".tex", figure=fig,
-                         extra_axis_parameters={"width=\\linewidth"})
+
+        tikzplotlib.save(
+            stem + ".tex", figure=fig, extra_axis_parameters={"width=\\linewidth"}
+        )
     except Exception:
         try:
             fig.savefig(stem + ".pgf", bbox_inches="tight")
@@ -83,6 +88,7 @@ def _save_fig(fig, path: str) -> None:
 
 
 # ── Training curves ────────────────────────────────────────────────────────
+
 
 def plot_training_curves(metrics: dict, save_dir: str) -> None:
     """
@@ -139,17 +145,21 @@ def plot_training_curves(metrics: dict, save_dir: str) -> None:
 
     if metrics.get("eval_success_rates") or metrics.get("eval_returns"):
         fig, ax = plt.subplots(figsize=(6, 4))
-        ref    = metrics.get("eval_success_rates") or metrics.get("eval_returns")
-        iters  = list(range(len(ref)))
+        ref = metrics.get("eval_success_rates") or metrics.get("eval_returns")
+        iters = list(range(len(ref)))
         if metrics.get("eval_success_rates"):
-            ax.plot(iters, metrics["eval_success_rates"],
-                    marker="o", color=_P["blue"])
+            ax.plot(iters, metrics["eval_success_rates"], marker="o", color=_P["blue"])
             ax.set_ylabel("success rate", color=_P["blue"])
             ax.tick_params(axis="y", labelcolor=_P["blue"])
         if metrics.get("eval_returns"):
             ax2 = ax.twinx()
-            ax2.plot(iters, metrics["eval_returns"],
-                     marker="s", color=_P["gold"], linestyle="--")
+            ax2.plot(
+                iters,
+                metrics["eval_returns"],
+                marker="s",
+                color=_P["gold"],
+                linestyle="--",
+            )
             ax2.set_ylabel("avg return", color=_P["gold"])
             ax2.tick_params(axis="y", labelcolor=_P["gold"])
         ax.set_xlabel("iteration")
@@ -161,8 +171,8 @@ def plot_training_curves(metrics: dict, save_dir: str) -> None:
 
 # ── Skeleton topology ──────────────────────────────────────────────────────
 
-def plot_skeleton_topology(skeleton_data: dict, replay_buffer,
-                           save_path: str) -> None:
+
+def plot_skeleton_topology(skeleton_data: dict, replay_buffer, save_path: str) -> None:
     """
     PCA-project all states to 2-D and draw:
       - background scatter of collected states (grey)
@@ -174,10 +184,10 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer,
 
     from sklearn.decomposition import PCA
 
-    landmarks       = skeleton_data["landmarks"]                 # [L, D] tensor
-    simplices       = skeleton_data["simplices"]                 # dict dim→list[tuple]
-    critical_states = skeleton_data["critical_states"]           # {c_id: np.array}
-    morse_values    = skeleton_data.get("morse_values", {})      # {v: scalar}
+    landmarks = skeleton_data["landmarks"]  # [L, D] tensor
+    simplices = skeleton_data["simplices"]  # dict dim→list[tuple]
+    critical_states = skeleton_data["critical_states"]  # {c_id: np.array}
+    morse_values = skeleton_data.get("morse_values", {})  # {v: scalar}
 
     L_np = landmarks.cpu().numpy() if hasattr(landmarks, "cpu") else np.array(landmarks)
     all_states_t = replay_buffer.get_all_states()
@@ -193,20 +203,33 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer,
     else:
         combined_2d = combined[:, :2]
 
-    L_2d    = combined_2d[:len(L_np)]
-    all_2d  = combined_2d[len(L_np):]
+    L_2d = combined_2d[: len(L_np)]
+    all_2d = combined_2d[len(L_np) :]
 
     fig, ax = plt.subplots(figsize=(8, 7))
 
     # Background states
-    ax.scatter(all_2d[:, 0], all_2d[:, 1],
-               s=3, c=_P["light"], alpha=0.3, zorder=1, label="states")
+    ax.scatter(
+        all_2d[:, 0],
+        all_2d[:, 1],
+        s=3,
+        c=_P["light"],
+        alpha=0.3,
+        zorder=1,
+        label="states",
+    )
 
     # 2-simplices (triangles)
     for tri in simplices.get(2, []):
         pts = L_2d[list(tri)]
-        poly = plt.Polygon(pts, alpha=0.12, facecolor=_P["blue"],
-                           edgecolor=_P["blue"], linewidth=0.5, zorder=2)
+        poly = plt.Polygon(
+            pts,
+            alpha=0.12,
+            facecolor=_P["blue"],
+            edgecolor=_P["blue"],
+            linewidth=0.5,
+            zorder=2,
+        )
         ax.add_patch(poly)
 
     # 1-simplices (edges)
@@ -214,41 +237,59 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer,
     for edge in simplices.get(1, []):
         segs.append([L_2d[edge[0]], L_2d[edge[1]]])
     if segs:
-        lc = mc.LineCollection(segs, colors=_P["blue"], linewidths=0.8,
-                               alpha=0.6, zorder=3)
+        lc = mc.LineCollection(
+            segs, colors=_P["blue"], linewidths=0.8, alpha=0.6, zorder=3
+        )
         ax.add_collection(lc)
 
     # Landmark vertices coloured by Morse value
-    mv_arr = np.array([
-        float(morse_values.get((i,), morse_values.get(i, 0.0))) for i in range(len(L_np))
-    ])
-    sc = ax.scatter(L_2d[:, 0], L_2d[:, 1],
-                    c=mv_arr, cmap=CMAP_DIV, s=40,
-                    edgecolors="k", linewidths=0.4, zorder=4,
-                    label="landmarks")
-    plt.colorbar(sc, ax=ax, label="Morse value", fraction=0.03)
+    mv_arr = np.array(
+        [
+            float(morse_values.get((i,), morse_values.get(i, 0.0)))
+            for i in range(len(L_np))
+        ]
+    )
+    sc = ax.scatter(
+        L_2d[:, 0],
+        L_2d[:, 1],
+        c=mv_arr,
+        cmap=CMAP_DIV,
+        s=40,
+        edgecolors="k",
+        linewidths=0.4,
+        zorder=4,
+        label="landmarks",
+    )
+    # plt.colorbar(sc, ax=ax, label="Morse value", fraction=0.03)
 
     # Critical states — project centroid arrays, not landmark indices
     c_ids = list(critical_states.keys())
     if c_ids:
-        crit_arr = np.stack([np.asarray(critical_states[k], dtype=np.float32)
-                             for k in c_ids])               # [K, D]
-        crit_xy  = pca.transform(crit_arr) if pca is not None else crit_arr[:, :2]
-        ax.scatter(crit_xy[:, 0], crit_xy[:, 1],
-                   s=200, facecolors="none", edgecolors=_P["red"],
-                   linewidths=2.0, zorder=5)
+        crit_arr = np.stack(
+            [np.asarray(critical_states[k], dtype=np.float32) for k in c_ids]
+        )  # [K, D]
+        crit_xy = pca.transform(crit_arr) if pca is not None else crit_arr[:, :2]
+        ax.scatter(
+            crit_xy[:, 0],
+            crit_xy[:, 1],
+            s=200,
+            facecolors="none",
+            edgecolors=_P["red"],
+            linewidths=2.0,
+            zorder=5,
+        )
     # Unwanted annotations for publication
-        #for i, c_id in enumerate(c_ids):
-        #    ax.annotate(str(c_id),
-        #                xy=crit_xy[i], xytext=(4, 4),
-        #                textcoords="offset points", fontsize=8,
-        #                color=_P["red"])
+    # for i, c_id in enumerate(c_ids):
+    #    ax.annotate(str(c_id),
+    #                xy=crit_xy[i], xytext=(4, 4),
+    #                textcoords="offset points", fontsize=8,
+    #                color=_P["red"])
 
     # ax.set_title("Witness Complex & Discrete Morse Function (PCA projection)")
     # ax.set_xlabel("PC 1"); ax.set_ylabel("PC 2")
-    ax.axis('off')
+    ax.axis("off")
 
-    #legend_handles = [
+    # legend_handles = [
     #    mpatches.Patch(color=_P["light"], label="collected states"),
     #    mpatches.Patch(color=_P["blue"], alpha=0.5, label="2-simplices"),
     #    mpatches.Patch(color=_P["blue"], label="1-simplices"),
@@ -257,14 +298,15 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer,
     #    plt.Line2D([0], [0], marker="o", color="w",
     #               markerfacecolor="none", markeredgecolor=_P["red"],
     #               markersize=10, markeredgewidth=2, label="critical states"),
-    #]
-    #ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
+    # ]
+    # ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
     fig.tight_layout()
     _save_fig(fig, save_path)
     print(f"  [Viz] Skeleton topology saved → {save_path}")
 
 
 # ── Policy evaluation ──────────────────────────────────────────────────────
+
 
 def _step_with_policy(policy, obs_arr, env):
     """
@@ -273,13 +315,19 @@ def _step_with_policy(policy, obs_arr, env):
     """
     if policy is None:
         a_np = env.action_space.sample()
-    elif hasattr(policy, "predict"):          # SB3 model
+    elif hasattr(policy, "predict"):  # SB3 model
         a_np, _ = policy.predict(obs_arr, deterministic=False)
-    else:                                      # legacy SubPolicy
+    else:  # legacy SubPolicy
         obs_t = torch.tensor(obs_arr)
-        a_np  = policy.get_action(obs_t).cpu().numpy()
+        a_np = policy.get_action(obs_t).cpu().numpy()
     obs_next, r, terminated, truncated, info = env.step(a_np)
-    return a_np, np.asarray(obs_next, dtype=np.float32).flatten(), float(r), terminated or truncated, info
+    return (
+        a_np,
+        np.asarray(obs_next, dtype=np.float32).flatten(),
+        float(r),
+        terminated or truncated,
+        info,
+    )
 
 
 def evaluate_policy(
@@ -287,34 +335,36 @@ def evaluate_policy(
     task_policies: dict,
     skeleton_data: dict,
     task_distribution,
-    n_episodes: int  = 20,
-    max_steps: int   = 500,
+    n_episodes: int = 20,
+    max_steps: int = 500,
     option_steps: int = 20,
-    gamma: float     = 0.99,
-    device: str      = "cpu",
+    gamma: float = 0.99,
+    device: str = "cpu",
 ) -> dict:
     """
     Evaluate the trained meta-policy + task policies on n_episodes tasks.
     task_policies: {task_id: SB3 model}  (or legacy {c_id: SubPolicy})
     Returns dict: success_rate, avg_return, per_env (dict).
     """
-    c_list        = list(skeleton_data["critical_states"].keys())
-    c_states      = [np.asarray(skeleton_data["critical_states"][c], dtype=np.float32)
-                     for c in c_list]
-    successes:    list = []
-    returns:      list = []
-    env_results:  dict = {}
+    c_list = list(skeleton_data["critical_states"].keys())
+    c_states = [
+        np.asarray(skeleton_data["critical_states"][c], dtype=np.float32)
+        for c in c_list
+    ]
+    successes: list = []
+    returns: list = []
+    env_results: dict = {}
 
     for _ in range(n_episodes):
-        task      = task_distribution.sample()
-        env       = task.create_env()
-        obs, _    = env.reset()
-        obs_arr   = np.asarray(obs, dtype=np.float32).flatten()
-        obs_t     = torch.tensor(obs_arr, device=device)
-        done      = False
+        task = task_distribution.sample()
+        env = task.create_env()
+        obs, _ = env.reset()
+        obs_arr = np.asarray(obs, dtype=np.float32).flatten()
+        obs_t = torch.tensor(obs_arr, device=device)
+        done = False
         ep_return = 0.0
-        t         = 0
-        success   = False
+        t = 0
+        success = False
 
         # Determine whether we're in task-policy mode or legacy sub-policy mode
         use_task_policies = task_policies and hasattr(
@@ -326,14 +376,16 @@ def evaluate_policy(
                 c_idx = meta_policy(obs_t).sample().item()
 
             if use_task_policies:
-                policy   = task_policies.get(task.id)
+                policy = task_policies.get(task.id)
                 c_target = c_states[c_idx]
                 for _ in range(option_steps):
                     if done or t >= max_steps:
                         break
-                    a_np, obs_arr, r, done, info = _step_with_policy(policy, obs_arr, env)
+                    a_np, obs_arr, r, done, info = _step_with_policy(
+                        policy, obs_arr, env
+                    )
                     success = success or bool(info.get("success", 0.0) > 0.5)
-                    ep_return += (gamma ** t) * r
+                    ep_return += (gamma**t) * r
                     obs_t = torch.tensor(obs_arr, device=device)
                     t += 1
                     if np.linalg.norm(obs_arr - c_target) < 0.5:
@@ -341,14 +393,15 @@ def evaluate_policy(
             else:
                 # Legacy SubPolicy path
                 c_id = c_list[c_idx]
-                sp   = task_policies.get(c_id)
-                T_c  = 0
+                sp = task_policies.get(c_id)
+                T_c = 0
                 while sp is not None and not sp.is_terminated(obs_t, done, T_c):
                     a_np, obs_arr, r, done, info = _step_with_policy(sp, obs_arr, env)
                     success = success or bool(info.get("success", 0.0) > 0.5)
-                    ep_return += (gamma ** t) * r
+                    ep_return += (gamma**t) * r
                     obs_t = torch.tensor(obs_arr, device=device)
-                    t += 1; T_c += 1
+                    t += 1
+                    T_c += 1
                     if done or t >= max_steps:
                         break
 
@@ -360,12 +413,13 @@ def evaluate_policy(
     per_env = {k: float(np.mean(v)) for k, v in env_results.items()}
     return {
         "success_rate": float(np.mean(successes)),
-        "avg_return":   float(np.mean(returns)),
-        "per_env":      per_env,
+        "avg_return": float(np.mean(returns)),
+        "per_env": per_env,
     }
 
 
 # ── Demo runner ────────────────────────────────────────────────────────────
+
 
 def run_demos(
     meta_policy,
@@ -373,12 +427,12 @@ def run_demos(
     skeleton_data: dict,
     task_distribution,
     save_dir: str,
-    n_demos: int      = 5,
-    max_steps: int    = 500,
+    n_demos: int = 5,
+    max_steps: int = 500,
     option_steps: int = 20,
-    render: bool      = True,
-    gamma: float      = 0.99,
-    device: str       = "cpu",
+    render: bool = True,
+    gamma: float = 0.99,
+    device: str = "cpu",
 ) -> list:
     """
     Run n_demos episodes, saving for each:
@@ -393,12 +447,14 @@ def run_demos(
 
     os.makedirs(save_dir, exist_ok=True)
 
-    c_list       = list(skeleton_data["critical_states"].keys())
-    c_states     = [np.asarray(skeleton_data["critical_states"][c], dtype=np.float32)
-                    for c in c_list]
+    c_list = list(skeleton_data["critical_states"].keys())
+    c_states = [
+        np.asarray(skeleton_data["critical_states"][c], dtype=np.float32)
+        for c in c_list
+    ]
     landmarks_np = skeleton_data["landmarks"].cpu().numpy()
 
-    D   = landmarks_np.shape[1]
+    D = landmarks_np.shape[1]
     pca = PCA(n_components=2).fit(landmarks_np) if D > 2 else None
 
     def _project(s_np):
@@ -411,8 +467,8 @@ def run_demos(
             return pca.transform(lm_np)
         return lm_np[:, :2]
 
-    lm_2d    = _project_lm(landmarks_np)
-    crit_2d  = lm_2d[:len(c_list)] if c_list else np.empty((0, 2))
+    lm_2d = _project_lm(landmarks_np)
+    crit_2d = lm_2d[: len(c_list)] if c_list else np.empty((0, 2))
 
     use_task_policies = task_policies and hasattr(
         next(iter(task_policies.values())), "predict"
@@ -434,15 +490,15 @@ def run_demos(
         env = task.create_env()
         obs, _ = env.reset()
         obs_arr = np.asarray(obs, dtype=np.float32).flatten()
-        obs_t   = torch.tensor(obs_arr, device=device)
+        obs_t = torch.tensor(obs_arr, device=device)
 
-        frames      = []
-        traj_pts    = [_project(obs_arr)]
+        frames = []
+        traj_pts = [_project(obs_arr)]
         sg_sequence = []
-        ep_return   = 0.0
-        t           = 0
-        done        = False
-        success     = False
+        ep_return = 0.0
+        t = 0
+        done = False
+        success = False
 
         while not done and t < max_steps:
             with torch.no_grad():
@@ -450,34 +506,39 @@ def run_demos(
             sg_sequence.append(c_idx)
 
             if use_task_policies:
-                policy   = task_policies.get(task.id)
+                policy = task_policies.get(task.id)
                 c_target = c_states[c_idx]
                 for _ in range(option_steps):
                     if done or t >= max_steps:
                         break
-                    a_np, obs_arr, r, done, info = _step_with_policy(policy, obs_arr, env)
+                    a_np, obs_arr, r, done, info = _step_with_policy(
+                        policy, obs_arr, env
+                    )
                     success = success or bool(info.get("success", 0.0) > 0.5)
-                    ep_return += (gamma ** t) * r
+                    ep_return += (gamma**t) * r
                     obs_t = torch.tensor(obs_arr, device=device)
                     traj_pts.append(_project(obs_arr))
                     if render and raw_env is not None:
-                        raw_env.step(a_np); frames.append(raw_env.render())
+                        raw_env.step(a_np)
+                        frames.append(raw_env.render())
                     t += 1
                     if np.linalg.norm(obs_arr - c_target) < 0.5:
                         break
             else:
                 c_id = c_list[c_idx]
-                sp   = task_policies.get(c_id)
-                T_c  = 0
+                sp = task_policies.get(c_id)
+                T_c = 0
                 while sp is not None and not sp.is_terminated(obs_t, done, T_c):
                     a_np, obs_arr, r, done, info = _step_with_policy(sp, obs_arr, env)
                     success = success or bool(info.get("success", 0.0) > 0.5)
-                    ep_return += (gamma ** t) * r
+                    ep_return += (gamma**t) * r
                     obs_t = torch.tensor(obs_arr, device=device)
                     traj_pts.append(_project(obs_arr))
                     if render and raw_env is not None:
-                        raw_env.step(a_np); frames.append(raw_env.render())
-                    t += 1; T_c += 1
+                        raw_env.step(a_np)
+                        frames.append(raw_env.render())
+                    t += 1
+                    T_c += 1
                     if done or t >= max_steps:
                         break
 
@@ -486,12 +547,12 @@ def run_demos(
             raw_env.close()
 
         ep_result = {
-            "demo":     demo_i,
-            "task":     task.env_name,
-            "task_id":  task.id,
-            "success":  success,
-            "return":   ep_return,
-            "steps":    t,
+            "demo": demo_i,
+            "task": task.env_name,
+            "task_id": task.id,
+            "success": success,
+            "return": ep_return,
+            "steps": t,
             "subgoals": sg_sequence,
         }
         results.append(ep_result)
@@ -511,55 +572,81 @@ def run_demos(
             ys = [lm_2d[edge[0], 1], lm_2d[edge[1], 1]]
             ax.plot(xs, ys, color=_P["fill"], linewidth=0.5, alpha=0.5, zorder=1)
 
-        ax.scatter(lm_2d[:, 0], lm_2d[:, 1],
-                   s=20, c=_P["mid"], alpha=0.5, zorder=2, label="landmarks")
+        ax.scatter(
+            lm_2d[:, 0],
+            lm_2d[:, 1],
+            s=20,
+            c=_P["mid"],
+            alpha=0.5,
+            zorder=2,
+            label="landmarks",
+        )
         if len(crit_2d):
-            ax.scatter(crit_2d[:, 0], crit_2d[:, 1],
-                       s=150, facecolors="none", edgecolors=_P["red"],
-                       linewidths=1.5, zorder=3, label="subgoals")
+            ax.scatter(
+                crit_2d[:, 0],
+                crit_2d[:, 1],
+                s=150,
+                facecolors="none",
+                edgecolors=_P["red"],
+                linewidths=1.5,
+                zorder=3,
+                label="subgoals",
+            )
 
         # Colour trajectory by active subgoal
         step_sg = []
         for sg in sg_sequence:
             step_sg.extend([sg] * max(1, (t // max(len(sg_sequence), 1))))
-        step_sg = step_sg[:len(traj) - 1]
+        step_sg = step_sg[: len(traj) - 1]
         for k in range(len(traj) - 1):
             sg_idx = step_sg[k] if k < len(step_sg) else 0
             col = _c(c_list.index(sg_idx) if sg_idx in c_list else 0)
-            ax.plot(traj[k:k+2, 0], traj[k:k+2, 1],
-                    color=col, linewidth=1.2, alpha=0.8, zorder=4)
+            ax.plot(
+                traj[k : k + 2, 0],
+                traj[k : k + 2, 1],
+                color=col,
+                linewidth=1.2,
+                alpha=0.8,
+                zorder=4,
+            )
 
-        ax.plot(*traj[0],  marker="^", ms=10, color=_P["blue"],
-                zorder=5, label="start")
-        ax.plot(*traj[-1], marker="*", ms=12,
-                color=_P["gold"] if success else _P["red"],
-                zorder=5, label="end (✓)" if success else "end (✗)")
+        ax.plot(*traj[0], marker="^", ms=10, color=_P["blue"], zorder=5, label="start")
+        ax.plot(
+            *traj[-1],
+            marker="*",
+            ms=12,
+            color=_P["gold"] if success else _P["red"],
+            zorder=5,
+            label="end (✓)" if success else "end (✗)",
+        )
 
         ax.legend(fontsize=7, loc="upper right")
         ax.axis("off")
         fig.tight_layout()
         status_tag = "success" if success else "fail"
-        traj_path  = os.path.join(
+        traj_path = os.path.join(
             save_dir,
             f"demo_{demo_i:02d}_{task.env_name}_{status_tag}_traj.png",
         )
         _save_fig(fig, traj_path)
 
         status = "SUCCESS" if success else "fail"
-        print(f"  [Demo {demo_i}] {task.env_name}  {status}  "
-              f"return={ep_return:.3f}  steps={t}")
+        print(
+            f"  [Demo {demo_i}] {task.env_name}  {status}  "
+            f"return={ep_return:.3f}  steps={t}"
+        )
 
     # Summary JSON
     summary_path = os.path.join(save_dir, "demo_summary.json")
     with open(summary_path, "w") as f:
         json.dump(results, f, indent=2)
     success_rate = np.mean([r["success"] for r in results])
-    print(f"  [Demo] Success rate: {success_rate:.1%}  "
-          f"summary → {summary_path}")
+    print(f"  [Demo] Success rate: {success_rate:.1%}  summary → {summary_path}")
     return results
 
 
 # ── Phase 3 callback & visualisation ──────────────────────────────────────
+
 
 class Phase3TrainingCallback(_SB3BaseCallback):
     """
@@ -571,22 +658,23 @@ class Phase3TrainingCallback(_SB3BaseCallback):
 
     def __init__(self):
         super().__init__(verbose=0)
-        self.ep_rewards:     list = []
+        self.ep_rewards: list = []
         self.ep_env_rewards: list = []
-        self.ep_shaping:     list = []
-        self.ep_successes:   list = []
-        self.ep_lengths:     list = []
-        self._step_env_r:    float = 0.0
-        self._step_shaping:  float = 0.0
+        self.ep_shaping: list = []
+        self.ep_successes: list = []
+        self.ep_lengths: list = []
+        self._step_env_r: float = 0.0
+        self._step_shaping: float = 0.0
 
     def _on_step(self) -> bool:
         # Accumulate per-step env reward and shaping bonus (single env assumed)
         infos = self.locals.get("infos", [{}])
-        self._step_env_r   += float(infos[0].get("r_env",     0.0))
+        self._step_env_r += float(infos[0].get("r_env", 0.0))
         self._step_shaping += float(infos[0].get("r_shaping", 0.0))
 
-        for done, info in zip(self.locals.get("dones", []),
-                              self.locals.get("infos", [])):
+        for done, info in zip(
+            self.locals.get("dones", []), self.locals.get("infos", [])
+        ):
             if done:
                 ep = info.get("episode", {})
                 self.ep_rewards.append(float(ep.get("r", 0.0)))
@@ -596,7 +684,7 @@ class Phase3TrainingCallback(_SB3BaseCallback):
                 )
                 self.ep_env_rewards.append(self._step_env_r)
                 self.ep_shaping.append(self._step_shaping)
-                self._step_env_r   = 0.0
+                self._step_env_r = 0.0
                 self._step_shaping = 0.0
         return True
 
@@ -623,8 +711,8 @@ def plot_phase3_results(
         return
 
     os.makedirs(save_dir, exist_ok=True)
-    tasks  = list(phase3_stats.keys())
-    n      = len(tasks)
+    tasks = list(phase3_stats.keys())
+    n = len(tasks)
     prefix = os.path.join(save_dir, f"phase3_iter_{iteration:03d}")
 
     # ── File 1: shaped reward learning curves ─────────────────────────────
@@ -638,8 +726,9 @@ def plot_phase3_results(
         w = max(1, min(50, len(ep_r) // 5))
         if len(ep_r) >= w:
             sm = np.convolve(ep_r, np.ones(w) / w, mode="valid")
-            ax.plot(np.arange(w - 1, len(ep_r)), sm,
-                    color=col, linewidth=2.0, label=tname)
+            ax.plot(
+                np.arange(w - 1, len(ep_r)), sm, color=col, linewidth=2.0, label=tname
+            )
     ax.set_xlabel("episode")
     ax.set_ylabel("shaped reward")
     ax.legend(fontsize=7, loc="lower right")
@@ -650,8 +739,7 @@ def plot_phase3_results(
     # ── File 2: env reward vs shaping bonus split ──────────────────────────
     fig, ax = plt.subplots(figsize=(7, 4))
     has_shaping = any(
-        any(v != 0 for v in phase3_stats[t].get("ep_shaping", []))
-        for t in tasks
+        any(v != 0 for v in phase3_stats[t].get("ep_shaping", [])) for t in tasks
     )
     if has_shaping:
         for i, tname in enumerate(tasks):
@@ -659,22 +747,37 @@ def plot_phase3_results(
             ep_s = phase3_stats[tname].get("ep_shaping", [])
             if not ep_e:
                 continue
-            col  = _c(i)
-            w    = max(1, min(50, len(ep_e) // 5))
+            col = _c(i)
+            w = max(1, min(50, len(ep_e) // 5))
             sm_e = np.convolve(ep_e, np.ones(w) / w, mode="valid")
             sm_s = np.convolve(ep_s, np.ones(w) / w, mode="valid")
-            xs   = np.arange(w - 1, len(ep_e))
-            ax.plot(xs, sm_e, color=col, linewidth=1.8,
-                    linestyle="-",  label=f"{tname} env")
-            ax.plot(xs, sm_s, color=col, linewidth=1.2,
-                    linestyle="--", alpha=0.7, label=f"{tname} shaping")
+            xs = np.arange(w - 1, len(ep_e))
+            ax.plot(
+                xs, sm_e, color=col, linewidth=1.8, linestyle="-", label=f"{tname} env"
+            )
+            ax.plot(
+                xs,
+                sm_s,
+                color=col,
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.7,
+                label=f"{tname} shaping",
+            )
         ax.set_xlabel("episode")
         ax.set_ylabel("cumulative reward / ep")
         ax.legend(fontsize=6, loc="lower right", ncol=2)
         ax.grid(alpha=0.3)
     else:
-        ax.text(0.5, 0.5, "No shaping active\n(potential=None)",
-                ha="center", va="center", transform=ax.transAxes, fontsize=10)
+        ax.text(
+            0.5,
+            0.5,
+            "No shaping active\n(potential=None)",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=10,
+        )
     fig.tight_layout()
     _save_fig(fig, f"{prefix}_reward_split.png")
 
@@ -687,8 +790,8 @@ def plot_phase3_results(
         avg_rets.append(float(np.mean(ep_r[-20:])) if ep_r else 0.0)
 
     fig, ax = plt.subplots(figsize=(max(4, n * 1.5), 4))
-    x    = np.arange(n)
-    bw   = 0.35
+    x = np.arange(n)
+    bw = 0.35
     cols = [_c(i) for i in range(n)]
     ax.bar(x - bw / 2, succ_rates, bw, color=cols, alpha=0.85)
     ax2 = ax.twinx()
@@ -701,9 +804,12 @@ def plot_phase3_results(
     ax2.set_ylabel("avg shaped return (last 20 ep)", color=_P["gold"])
     ax2.tick_params(axis="y", labelcolor=_P["gold"])
     ax.grid(axis="y", alpha=0.3)
-    leg = [mpatches.Patch(facecolor=_P["mid"], alpha=0.85, label="success rate"),
-           mpatches.Patch(facecolor=_P["mid"], alpha=0.45, hatch="//",
-                          label="avg shaped return")]
+    leg = [
+        mpatches.Patch(facecolor=_P["mid"], alpha=0.85, label="success rate"),
+        mpatches.Patch(
+            facecolor=_P["mid"], alpha=0.45, hatch="//", label="avg shaped return"
+        ),
+    ]
     ax.legend(handles=leg, fontsize=7, loc="upper right")
     fig.tight_layout()
     _save_fig(fig, f"{prefix}_final_perf.png")
@@ -712,9 +818,10 @@ def plot_phase3_results(
 
 # ── Per-iteration topology snapshot ───────────────────────────────────────
 
-def save_iteration_visuals(skeleton_data: dict, replay_buffer,
-                           metrics: dict, save_dir: str,
-                           iteration: int) -> None:
+
+def save_iteration_visuals(
+    skeleton_data: dict, replay_buffer, metrics: dict, save_dir: str, iteration: int
+) -> None:
     """Convenience wrapper: save topology + training curves after each iteration."""
     topo_path = os.path.join(save_dir, f"topology_iter_{iteration:03d}.png")
     plot_skeleton_topology(skeleton_data, replay_buffer, topo_path)

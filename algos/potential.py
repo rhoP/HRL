@@ -335,6 +335,83 @@ class KNNBackwardEstimator:
         return list(self._data.keys())
 
 
+# ── Witness-based simplex potential ───────────────────────────────────────
+
+class WitnessBasedSimplexPotential:
+    """
+    Consistent simplex potential using KNNBackwardEstimator as the single
+    potential evaluator, with witness-based aggregation for higher simplices.
+
+    dim 0 (vertices)
+        Φ(v) = knn_estimator.phi(landmarks[v], task_id)
+        The landmark location itself is queried — no witnesses needed.
+
+    dim ≥ 1 (edges, triangles, …)
+        Φ(σ) = mean over witness states w that have every vertex of σ
+                among their k-nearest landmarks of
+                knn_estimator.phi(witness_states[w], task_id)
+        Falls back to mean of vertex potentials when no witnesses exist.
+
+    Using the same knn_estimator for both cases keeps all phi values on the
+    same scale, making the Morse function comparison across dimensions valid.
+
+    Parameters
+    ----------
+    landmarks           : np.ndarray [L, D]   landmark positions
+    witness_states      : np.ndarray [N, D]   state visited by the agent (query states)
+    witness_assignments : {state_idx: [landmark_idx, ...]}  k-nearest per state
+    knn_estimator       : KNNBackwardEstimator
+    task_id             : int
+    """
+
+    def __init__(
+        self,
+        landmarks: np.ndarray,
+        witness_states: np.ndarray,
+        witness_assignments: dict,
+        knn_estimator,
+        task_id: int,
+    ):
+        self.landmarks           = landmarks
+        self.witness_states      = witness_states
+        self.witness_assignments = witness_assignments
+        self.knn_estimator       = knn_estimator
+        self.task_id             = task_id
+        self._witness_cache: dict = {}   # simplex → list[state_idx]
+
+    def get_simplex_witnesses(self, simplex: tuple) -> list:
+        """Return state indices whose k-nearest landmarks cover all vertices of simplex."""
+        if simplex in self._witness_cache:
+            return self._witness_cache[simplex]
+        simplex_set = set(simplex)
+        witnesses = [
+            idx for idx, lm_list in self.witness_assignments.items()
+            if simplex_set.issubset(set(lm_list))
+        ]
+        self._witness_cache[simplex] = witnesses
+        return witnesses
+
+    def get_potential(self, simplex: tuple) -> float:
+        """
+        Compute Φ(σ) using KNNBackwardEstimator.
+
+        Vertices use the landmark location directly; higher simplices use the
+        mean knn phi over all witness states that cover every vertex of σ.
+        """
+        if len(simplex) == 1:
+            return self.knn_estimator.phi(self.landmarks[simplex[0]], self.task_id)
+
+        witnesses = self.get_simplex_witnesses(simplex)
+        if not witnesses:
+            # Fall back to mean of vertex potentials
+            return float(np.mean([self.get_potential((v,)) for v in simplex]))
+
+        return float(np.mean([
+            self.knn_estimator.phi(self.witness_states[w], self.task_id)
+            for w in witnesses
+        ]))
+
+
 # ── Gym wrapper ────────────────────────────────────────────────────────────
 
 class ShapedRewardWrapper(gym.Wrapper):

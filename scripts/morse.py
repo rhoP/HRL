@@ -19,7 +19,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from utils.collect import Collector
-from algos.potential import KNNBackwardEstimator   # noqa: E402
+from algos.potential import KNNBackwardEstimator, WitnessBasedSimplexPotential   # noqa: E402
 from models.state_action_encoder import (          # noqa: E402
     StateActionEncoder,
     train_state_action_encoder,
@@ -421,12 +421,15 @@ def compute_simplex_potential(simplex_vertices, landmark_states_np, knn_estimato
     return float(np.mean(vals)) if vals else 0.0
 
 
-def compute_morse_function(simplices, landmark_states, knn_estimator, task_ids):
+def compute_morse_function(simplices, landmark_states, knn_estimator, task_ids,
+                           witness_potential=None):
     """
     Compute the discrete Morse function on all simplices using k-NN potentials.
 
-    phi_values  — k-NN backward-return estimates for every simplex.
-                  Values are in the original reward scale (no normalisation).
+    phi_values  — potential estimates for every simplex.
+      dim 0     : k-NN backward-return at the landmark vertex.
+      dim ≥ 1   : witness-based mean Φ when witness_potential is provided,
+                  otherwise vertex-mean k-NN (legacy path).
 
     morse_values — Discrete Morse function used for critical-simplex detection:
 
@@ -436,30 +439,44 @@ def compute_morse_function(simplices, landmark_states, knn_estimator, task_ids):
 
     Parameters
     ----------
-    simplices       : dict {dim: [simplex_tuple, ...]}
-    landmark_states : torch.Tensor or np.ndarray [L, D]
-    knn_estimator   : KNNBackwardEstimator
-    task_ids        : list[int]
+    simplices          : dict {dim: [simplex_tuple, ...]}
+    landmark_states    : torch.Tensor or np.ndarray [L, D]
+    knn_estimator      : KNNBackwardEstimator
+    task_ids           : list[int]
+    witness_potential  : WitnessBasedSimplexPotential or None
+        When provided, phi for all dim ≥ 1 simplices is the mean potential
+        of their witness states rather than the vertex-mean k-NN estimate.
     """
     lm_np = (landmark_states.cpu().numpy()
              if hasattr(landmark_states, "cpu") else np.asarray(landmark_states))
 
-    # ── Phase 1: k-NN potential for every simplex ─────────────────────────
+    # ── Phase 1: potential for every simplex ──────────────────────────────
+    # When witness_potential is provided it handles all dimensions:
+    #   dim 0  — knn_estimator.phi at the landmark location
+    #   dim ≥1 — mean knn_estimator.phi over witness states covering the simplex
+    # Both paths use the same KNNBackwardEstimator, keeping phi values on a
+    # consistent scale across dimensions.
     phi_values: dict = {}
     for dim, simplex_list in simplices.items():
         for simplex in simplex_list:
-            phi_values[simplex] = compute_simplex_potential(
-                simplex, lm_np, knn_estimator, task_ids
-            )
+            if witness_potential is not None:
+                phi_values[simplex] = witness_potential.get_potential(simplex)
+            else:
+                phi_values[simplex] = compute_simplex_potential(
+                    simplex, lm_np, knn_estimator, task_ids
+                )
 
     # Ensure orphan vertices (present in edges but not as 0-simplices) have
     # phi entries so edge gradients are computed correctly.
     all_verts = {v for sl in simplices.values() for s in sl for v in s}
     for v in all_verts:
         if (v,) not in phi_values:
-            phi_values[(v,)] = compute_simplex_potential(
-                (v,), lm_np, knn_estimator, task_ids
-            )
+            if witness_potential is not None:
+                phi_values[(v,)] = witness_potential.get_potential((v,))
+            else:
+                phi_values[(v,)] = compute_simplex_potential(
+                    (v,), lm_np, knn_estimator, task_ids
+                )
 
     # ── Phase 2: Discrete Morse function ─────────────────────────────────
     morse_values: dict = {}
@@ -825,7 +842,8 @@ def _build_task_complex(
             task_actions.append(actions[t])
 
     if not task_states:
-        return {d: [] for d in range(max_dim + 1)}, {}, {}
+        empty_dim = {d: [] for d in range(max_dim + 1)}
+        return empty_dim, {}, {}, np.empty((0, landmark_states.shape[1]), dtype=np.float32), []
 
     ts_t  = torch.tensor(np.array(task_states,  dtype=np.float32), device=device)
     ta_np = np.array(task_actions, dtype=np.float32)
@@ -842,9 +860,10 @@ def _build_task_complex(
         query_embs = ts_t.cpu()
         key_embs   = lm.cpu()
 
-    witness_count     = defaultdict(int)
-    edge_action_sums  = {}
-    edge_action_cnts  = defaultdict(int)
+    witness_count      = defaultdict(int)
+    edge_action_sums   = {}
+    edge_action_cnts   = defaultdict(int)
+    collected_neighbors: list = []   # per-witness sorted k-nearest landmark indices
 
     for start in range(0, len(query_embs), chunk_size):
         chunk_q = query_embs[start : start + chunk_size]
@@ -855,6 +874,7 @@ def _build_task_complex(
             w_abs     = start + i
             neighbors = tuple(sorted(row))
             act       = ta_np[w_abs]
+            collected_neighbors.append(neighbors)
             for d in range(max_dim + 1):
                 for sigma in combinations(neighbors, d + 1):
                     witness_count[sigma] += 1
@@ -877,7 +897,8 @@ def _build_task_complex(
                 if dim == 1 and edge_action_cnts[sigma] > 0:
                     edge_action_labels[sigma] = edge_action_sums[sigma] / edge_action_cnts[sigma]
 
-    return simplices, simplex_task_ids, edge_action_labels
+    task_states_arr = np.array(task_states, dtype=np.float32)
+    return simplices, simplex_task_ids, edge_action_labels, task_states_arr, collected_neighbors
 
 
 def _persistent_critical_simplices(
@@ -1111,6 +1132,7 @@ def build_meta_morse_complex(
         print(f"  [MetaMorse] Step 2: per-task analysis ({len(unique_tasks)} task(s))...")
 
     landmark_states = landmarks.to(device)
+    lm_np           = landmark_states.cpu().numpy()
 
     # ── Shared k-NN backward estimator (all tasks) ────────────────────────
     knn_estimator = KNNBackwardEstimator(replay_buffer, gamma=gamma, k=knn_k)
@@ -1138,26 +1160,39 @@ def build_meta_morse_complex(
             print(f"    Task {tid}:")
 
         # ── Task-specific witness complex ─────────────────────────────────
-        t_simplices, t_stids, t_eal = _build_task_complex(
+        t_simplices, t_stids, t_eal, t_states, t_neighbors = _build_task_complex(
             tid, landmark_states, replay_buffer,
             sa_encoder=sa_encoder, nu=nu, max_dim=max_dim, device=device,
         )
 
-        # ── Morse function + persistent critical simplices ────────────────
-        morse_vals, phi_vals = compute_morse_function(
-            t_simplices, landmark_states, knn_estimator, [tid]
+        # ── Witness-based simplex potential ───────────────────────────────
+        wit_assignments = {i: list(t_neighbors[i]) for i in range(len(t_neighbors))}
+        wit_pot = WitnessBasedSimplexPotential(
+            landmarks=lm_np,
+            witness_states=t_states,
+            witness_assignments=wit_assignments,
+            knn_estimator=knn_estimator,
+            task_id=tid,
         )
 
-        persistent = _persistent_critical_simplices(
-            t_simplices, morse_vals, persistence_threshold=persistence_threshold,
+        # ── Morse function + persistent critical simplices ────────────────
+        morse_vals, phi_vals = compute_morse_function(
+            t_simplices, landmark_states, knn_estimator, [tid],
+            witness_potential=wit_pot,
         )
-        # Optional magnitude gate
-        all_mv = [v for v in morse_vals.values()]
-        if all_mv and threshold_percentile > 0:
-            mag_th = float(np.percentile(np.abs(all_mv), threshold_percentile))
-            for dim in persistent:
-                persistent[dim] = [s for s in persistent[dim]
-                                   if abs(morse_vals.get(s, 0.0)) >= mag_th]
+
+        # Z-score normalise morse_vals before persistence filtering so that
+        # the gap threshold is scale-invariant (fixes the apples-vs-oranges
+        # comparison between dim-0 raw phi values and dim-1 gradients).
+        mv_arr = np.array(list(morse_vals.values()), dtype=np.float32)
+        mv_mean = float(mv_arr.mean()) if len(mv_arr) else 0.0
+        mv_std  = float(mv_arr.std())  if len(mv_arr) else 1.0
+        mv_std  = mv_std if mv_std > 1e-8 else 1.0
+        morse_vals_norm = {s: (v - mv_mean) / mv_std for s, v in morse_vals.items()}
+
+        persistent = _persistent_critical_simplices(
+            t_simplices, morse_vals_norm, persistence_threshold=persistence_threshold,
+        )
 
         t_crit_states = {sigma[0]: landmark_states[sigma[0]].cpu().numpy()
                          for sigma in persistent.get(0, [])}
@@ -1178,8 +1213,6 @@ def build_meta_morse_complex(
     if verbose:
         print("  [MetaMorse] Step 3: computing meta-complex...")
 
-    lm_np = landmark_states.cpu().numpy()
-
     meta_subgoals = meta_critical_states(
         task_critical, lm_np,
         min_task_support=min_task_support,
@@ -1194,7 +1227,7 @@ def build_meta_morse_complex(
     seen:           set  = set()
 
     for tid in unique_tasks:
-        t_simplices, t_stids, t_eal = _build_task_complex(
+        t_simplices, t_stids, t_eal, _, _ = _build_task_complex(
             tid, landmark_states, replay_buffer,
             sa_encoder=sa_encoder, nu=nu, max_dim=max_dim, device=device,
         )
