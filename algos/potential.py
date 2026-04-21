@@ -10,6 +10,7 @@ ShapedRewardWrapper           — Gymnasium wrapper applying potential shaping.
 import numpy as np
 import networkx as nx
 import gymnasium as gym
+from scipy.spatial import KDTree
 
 
 # ── Nearest-subgoal lookup ─────────────────────────────────────────────────
@@ -158,15 +159,25 @@ class EmpiricalHittingTimePotential:
                     "backward_return": float(np.dot(rewards[:n], exps)),
                 })
 
+        # Build one KDTree per subgoal (O(N log N) once, O(log N) per query).
+        self._trees:     dict = {}
+        self._back_rets: dict = {}
+        for sg_id, trajs in self._trajs.items():
+            if trajs:
+                starts = np.stack([t["start_state"] for t in trajs])
+                self._trees[sg_id]     = KDTree(starts)
+                self._back_rets[sg_id] = np.array(
+                    [t["backward_return"] for t in trajs], dtype=np.float32
+                )
+
     def get_potential(self, s, sg_id) -> float:
-        trajs = self._trajs.get(sg_id, [])
-        if not trajs:
+        tree = self._trees.get(sg_id)
+        if tree is None:
             return 0.0
-        s_arr   = np.asarray(s, dtype=np.float32).flatten()
-        starts  = np.stack([t["start_state"] for t in trajs])
-        dists   = np.linalg.norm(starts - s_arr, axis=1)
-        nearest = np.argsort(dists)[: self.k]
-        return float(np.mean([trajs[i]["backward_return"] for i in nearest]))
+        s_arr = np.asarray(s, dtype=np.float32).flatten()
+        k     = min(self.k, len(self._back_rets[sg_id]))
+        _, nn_idx = tree.query(s_arr, k=k)
+        return float(np.mean(self._back_rets[sg_id][nn_idx]))
 
     def get_intrinsic_reward(self, s, s_next, sg_id) -> float:
         return self.get_potential(s_next, sg_id) - self.get_potential(s, sg_id)
@@ -301,16 +312,25 @@ class KNNBackwardEstimator:
                     "back_ret": float(back_rets[t]),
                 })
 
+        # Build one KDTree per task_id (O(N log N) once, O(log N) per query).
+        self._trees:     dict = {}
+        self._back_rets: dict = {}
+        for tid, entries in self._data.items():
+            pts = np.stack([e["state"] for e in entries])
+            self._trees[tid]     = KDTree(pts)
+            self._back_rets[tid] = np.array(
+                [e["back_ret"] for e in entries], dtype=np.float32
+            )
+
     def phi(self, s: np.ndarray, task_id: int = 0) -> float:
         """Φ(s; task) — k-NN mean backward-discounted return from visited states."""
-        entries = self._data.get(task_id, [])
-        if not entries:
+        tree = self._trees.get(task_id)
+        if tree is None:
             return 0.0
         s_flat = np.asarray(s, dtype=np.float32).flatten()
-        states = np.stack([e["state"] for e in entries])
-        dists  = np.linalg.norm(states - s_flat, axis=1)
-        nn_idx = np.argsort(dists)[: self.k]
-        return float(np.mean([entries[i]["back_ret"] for i in nn_idx]))
+        k      = min(self.k, len(self._back_rets[task_id]))
+        _, nn_idx = tree.query(s_flat, k=k)
+        return float(np.mean(self._back_rets[task_id][nn_idx]))
 
     def back_ret_stats(self) -> dict:
         """Return per-task diagnostics: n, mean, std of back_ret values.
