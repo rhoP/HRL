@@ -460,6 +460,7 @@ def main(
     collect_episodes: int    = 50,
     gamma: float             = 0.97,
     shaping_scale: float     = 1.0,
+    shaping_scale_start: float = 0.1,
     subgoal_threshold: float = float("inf"),
     potential_alpha: float   = 0.5,
     meta_epochs: int         = 1000,
@@ -551,7 +552,7 @@ def main(
         plot_training_curves(metrics, save_dir)
         return None, None, skeleton, metrics
 
-    meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True, gru_hidden=0).to(device)
+    meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True, gru_hidden=64).to(device)
     meta_value_net = None
     training_state = None
 
@@ -560,6 +561,18 @@ def main(
             print(f"\n{'─'*60}")
             print(f"Iteration {iteration + 1}/{num_iterations}")
             print(f"{'─'*60}")
+
+        # Cross-iteration shaping annealing: ramp from shaping_scale_start to
+        # shaping_scale over the course of all iterations.  This prevents the
+        # large distribution jump at iteration boundaries that occurs when the
+        # potential is rebuilt with a full-amplitude shaped reward from epoch 0.
+        if num_iterations > 1:
+            t = iteration / (num_iterations - 1)
+        else:
+            t = 1.0
+        iter_shaping_scale = shaping_scale_start + (shaping_scale - shaping_scale_start) * t
+        if verbose:
+            print(f"  shaping_scale for this iteration: {iter_shaping_scale:.3f}")
 
         # Phase 2
         if verbose:
@@ -576,7 +589,7 @@ def main(
             skeleton, task_distribution,
             potential=potential,
             timesteps_per_task=task_steps,
-            shaping_scale=shaping_scale,
+            shaping_scale=iter_shaping_scale,
             device=device, verbose=verbose,
             save_dir=save_dir, iteration=iteration,
             existing_task_policies=task_policies,
@@ -601,7 +614,7 @@ def main(
                 is_clip_epsilon=is_clip_epsilon,
                 replay_buffer=rb,
                 gamma=gamma,
-                shaping_scale=shaping_scale,
+                shaping_scale=iter_shaping_scale,
                 subgoal_threshold=subgoal_threshold,
                 flush_buffer=True,
                 device=device, verbose=verbose,
@@ -730,7 +743,10 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps",    type=int,   default=50_000,
                         help="PPO timesteps per task in Phase 0")
     parser.add_argument("--n-envs",       type=int,   default=10)
-    parser.add_argument("--shaping-scale",     type=float, default=1.0)
+    parser.add_argument("--shaping-scale",       type=float, default=1.0)
+    parser.add_argument("--shaping-scale-start", type=float, default=0.1,
+                        help="Shaping scale at iteration 0; linearly ramps to "
+                             "--shaping-scale by the final iteration (default: 0.1)")
     parser.add_argument("--subgoal-threshold", type=float, default=float("inf"))
     parser.add_argument("--potential-alpha",   type=float, default=0.5)
     parser.add_argument("--eval-episodes", type=int, default=20)
@@ -763,6 +779,7 @@ if __name__ == "__main__":
             task_steps=args.task_steps,
             gamma=0.99,
             shaping_scale=args.shaping_scale,
+            shaping_scale_start=args.shaping_scale_start,
             subgoal_threshold=args.subgoal_threshold,
             potential_alpha=args.potential_alpha,
             meta_epochs=args.meta_epochs,

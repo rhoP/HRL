@@ -13,13 +13,27 @@ import gymnasium as gym
 from scipy.spatial import KDTree
 
 
+# ── Device-agnostic array conversion ──────────────────────────────────────
+
+def _to_numpy_f32(x) -> np.ndarray:
+    """Convert any array-like or torch tensor (including MPS/CUDA) to float32 numpy.
+
+    All public entry points that accept state arrays call this so callers on
+    MPS or CUDA devices never need to manually move tensors to CPU first.
+    """
+    if hasattr(x, "detach"):          # torch.Tensor on any device
+        return x.detach().cpu().numpy().astype(np.float32, copy=False)
+    return np.asarray(x, dtype=np.float32)
+
+
 # ── Nearest-subgoal lookup ─────────────────────────────────────────────────
 
-def _nearest_subgoal(s: np.ndarray, meta_subgoals: dict):
+def _nearest_subgoal(s, meta_subgoals: dict):
     """Return (sg_id, distance) of the meta-subgoal nearest to s."""
+    s_arr = _to_numpy_f32(s).flatten()
     best_id, best_d = None, float("inf")
     for sg_id, sg_data in meta_subgoals.items():
-        d = float(np.linalg.norm(s - np.asarray(sg_data["state"], dtype=np.float32)))
+        d = float(np.linalg.norm(s_arr - _to_numpy_f32(sg_data["state"]).flatten()))
         if d < best_d:
             best_d, best_id = d, sg_id
     return best_id, best_d
@@ -46,8 +60,8 @@ def compute_sparse_shaped_reward(
         r_shaped    float
         shaping_info dict  {subgoal_id, distance, r_intrinsic, triggered}
     """
-    s_arr      = np.asarray(s,      dtype=np.float32).flatten()
-    s_next_arr = np.asarray(s_next, dtype=np.float32).flatten()
+    s_arr      = _to_numpy_f32(s).flatten()
+    s_next_arr = _to_numpy_f32(s_next).flatten()
 
     sg_id, dist = _nearest_subgoal(s_next_arr, meta_subgoals)
     triggered   = (sg_id is not None) and (dist <= subgoal_threshold)
@@ -79,19 +93,19 @@ class SkeletonPotential:
     cached after first lookup.
     """
 
-    def __init__(self, landmarks: np.ndarray, simplices: dict, meta_subgoals: dict):
-        self.landmarks = landmarks
+    def __init__(self, landmarks, simplices: dict, meta_subgoals: dict):
+        self.landmarks = _to_numpy_f32(landmarks)
         self.subgoals  = meta_subgoals
 
         self.G = nx.Graph()
-        for i in range(len(landmarks)):
+        for i in range(len(self.landmarks)):
             self.G.add_node(i)
         for edge in simplices.get(1, []):
             self.G.add_edge(edge[0], edge[1])   # unit weight — hop count
 
         self._sg_landmarks: dict = {
             sg_id: int(np.argmin(np.linalg.norm(
-                landmarks - np.asarray(sg_data["state"], dtype=np.float32), axis=1
+                self.landmarks - _to_numpy_f32(sg_data["state"]).flatten(), axis=1
             )))
             for sg_id, sg_data in meta_subgoals.items()
         }
@@ -101,7 +115,7 @@ class SkeletonPotential:
         return int(np.argmin(np.linalg.norm(self.landmarks - s, axis=1)))
 
     def get_potential(self, s, sg_id) -> float:
-        s_arr = np.asarray(s, dtype=np.float32).flatten()
+        s_arr = _to_numpy_f32(s).flatten()
         v_s   = self._closest_landmark(s_arr)
         v_c   = self._sg_landmarks[sg_id]
         key   = (v_s, v_c)
@@ -174,7 +188,7 @@ class EmpiricalHittingTimePotential:
         tree = self._trees.get(sg_id)
         if tree is None:
             return 0.0
-        s_arr = np.asarray(s, dtype=np.float32).flatten()
+        s_arr = _to_numpy_f32(s).flatten()
         k     = min(self.k, len(self._back_rets[sg_id]))
         _, nn_idx = tree.query(s_arr, k=k)
         return float(np.mean(self._back_rets[sg_id][nn_idx]))
@@ -216,6 +230,7 @@ class CombinedPotential:
         self._emp     = empirical_potential
         self.alpha    = alpha
 
+        landmarks        = _to_numpy_f32(landmarks)
         self._skel_scale = self._estimate_scale(skeleton_potential, landmarks)
         self._emp_scale  = self._estimate_scale(empirical_potential, landmarks)
 
@@ -327,7 +342,7 @@ class KNNBackwardEstimator:
         tree = self._trees.get(task_id)
         if tree is None:
             return 0.0
-        s_flat = np.asarray(s, dtype=np.float32).flatten()
+        s_flat = _to_numpy_f32(s).flatten()
         k      = min(self.k, len(self._back_rets[task_id]))
         _, nn_idx = tree.query(s_flat, k=k)
         return float(np.mean(self._back_rets[task_id][nn_idx]))
@@ -457,12 +472,12 @@ class ShapedRewardWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         obs, info      = self.env.reset(**kwargs)
-        self._last_obs = np.asarray(obs, dtype=np.float32).flatten()
+        self._last_obs = _to_numpy_f32(obs).flatten()
         return obs, info
 
     def step(self, action):
         obs, r, terminated, truncated, info = self.env.step(action)
-        obs_arr = np.asarray(obs, dtype=np.float32).flatten()
+        obs_arr = _to_numpy_f32(obs).flatten()
         r_env = float(r)
         r_int = 0.0
         if self._last_obs is not None:

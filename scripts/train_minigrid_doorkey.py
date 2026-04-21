@@ -589,7 +589,7 @@ def main(
         plot_training_curves(metrics, save_dir)
         return None, None, skeleton, metrics
 
-    meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True, gru_hidden=0).to(device)
+    meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True, gru_hidden=64).to(device)
     meta_value_net = None
     training_state = None
 

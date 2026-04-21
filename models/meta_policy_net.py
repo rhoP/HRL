@@ -245,7 +245,8 @@ class MetaValueNetwork(nn.Module):
                state only (backward compat when gru_hidden=0)
         """
         if not isinstance(s, torch.Tensor):
-            s = torch.tensor(np.asarray(s, dtype=np.float32))
+            device = next(self.parameters()).device
+            s = torch.tensor(np.asarray(s, dtype=np.float32), device=device)
         if s.dim() == 1:
             s = s.unsqueeze(0)
         if h is not None:

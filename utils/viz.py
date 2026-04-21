@@ -242,7 +242,7 @@ def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
                     fontsize=6, color=_P["mid"], va="bottom")
 
         ax.set_title(labels[key], fontsize=10)
-        ax.set_xlabel("epoch (continuous across iterations)", fontsize=8)
+        ax.set_xlabel("epoch", fontsize=8)
         ax.grid(alpha=0.25)
 
     n_iters = len([r for r in phase4_losses if r])

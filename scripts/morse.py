@@ -905,7 +905,7 @@ def _build_task_complex(
 
     # Choose query and key embeddings (SA or plain state)
     if sa_encoder is not None:
-        ta_t      = torch.tensor(ta_np, device=device)
+        ta_t      = torch.tensor(ta_np, dtype=torch.float32, device=device)
         act_dim   = ta_np.shape[-1]
         zero_acts = torch.zeros(n_landmarks, act_dim, device=device)
         with torch.no_grad():
