@@ -441,11 +441,11 @@ def main(
     n_envs: int              = 10,
     task_steps: int          = 20_000,
     collect_episodes: int    = 50,
-    gamma: float             = 0.99,
+    gamma: float             = 0.97,
     shaping_scale: float     = 1.0,
     subgoal_threshold: float = float("inf"),
     potential_alpha: float   = 0.5,
-    meta_epochs: int         = 200,
+    meta_epochs: int         = 1000,
     episodes_per_update: int = 4,
     entropy_coef: float      = 0.01,
     is_buffer_size: int      = 16,
@@ -474,7 +474,7 @@ def main(
     metrics = {
         "skeleton_train_losses": [],
         "phase3_success_rates":  [],
-        "phase4_returns":        [],
+        "phase4_losses":         [],
         "eval_success_rates":    [],
         "eval_returns":          [],
     }
@@ -501,9 +501,17 @@ def main(
     # Phase 1
     if verbose:
         print("\n[Phase 1] Building Morse skeleton...")
+    # Goal coordinates (s[3:5]) dominate inter-task distances, splitting the
+    # complex into disconnected manifolds.  Use only agent (x, y) for FPS and
+    # witness-complex distances; full state is still used for KNN phi estimates.
+    _pos_proj = lambda s: s[:2]  # noqa: E731
+
     skeleton = phase1_build_skeleton(rb,
                                      state_dim=STATE_DIM, action_dim=ACTION_DIM,
                                      num_landmarks=num_landmarks,
+                                     state_projection_fn=_pos_proj,
+                                     sa_epochs=0,
+                                     min_task_support=0.4,
                                      device=device, verbose=verbose)
     skeleton["_potential_stale"] = True
     metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
@@ -525,7 +533,7 @@ def main(
         plot_training_curves(metrics, save_dir)
         return None, None, skeleton, metrics
 
-    meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True).to(device)
+    meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True, gru_hidden=0).to(device)
     meta_value_net = None
     task_policies  = {}
     training_state = None
@@ -577,10 +585,11 @@ def main(
                 gamma=gamma,
                 shaping_scale=shaping_scale,
                 subgoal_threshold=subgoal_threshold,
+                flush_buffer=True,
                 device=device, verbose=verbose,
                 training_state=training_state,
             )
-        metrics["phase4_returns"].append(p4_losses)
+        metrics["phase4_losses"].append(p4_losses)
 
         # Evaluate
         eval_result = evaluate_policy(
@@ -602,7 +611,7 @@ def main(
             task_policies=task_policies,
             skeleton_data=skeleton, replay_buffer=rb,
             metrics={"eval": eval_result,
-                     "p4_avg_return": float(np.mean(p4_losses)) if p4_losses else 0.0},
+                     "p4_avg_loss": float(np.mean([e["total"] for e in p4_losses])) if p4_losses else 0.0},
         )
         if tracker.update(eval_result["success_rate"], ckpt_dir) and verbose:
             print(f"  ★ New best (success_rate={eval_result['success_rate']:.1%})")
@@ -643,10 +652,11 @@ def main(
                 print("[Refine] Rebuilding skeleton...")
             skeleton = refine_skeleton(skeleton, rb,
                                        num_landmarks=num_landmarks,
+                                       state_projection_fn=_pos_proj,
+                                       sa_epochs=0,
+                                       min_task_support=0.4,
                                        device=device, verbose=verbose)
             skeleton["_potential_stale"] = True
-            if training_state is not None:
-                training_state["is_buffer"] = None
             metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
             n_sub = len(skeleton["critical_states"])
             if verbose:
@@ -699,7 +709,7 @@ if __name__ == "__main__":
     parser.add_argument("--is-buffer-size",  type=int,   default=16)
     parser.add_argument("--is-clip-epsilon", type=float, default=0.2)
     parser.add_argument("--task-steps",   type=int,   default=20_000)
-    parser.add_argument("--timesteps",    type=int,   default=20_000,
+    parser.add_argument("--timesteps",    type=int,   default=50_000,
                         help="PPO timesteps per task in Phase 0")
     parser.add_argument("--n-envs",       type=int,   default=10)
     parser.add_argument("--shaping-scale",     type=float, default=1.0)

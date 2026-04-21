@@ -411,11 +411,12 @@ def main_meta_rl_loop(
     n_envs: int             = 10,
     task_policy_steps: int  = 10_000,
     collect_episodes: int   = 20,
-    gamma: float            = 0.99,
-    meta_epochs: int        = 500,
+    gamma: float            = 0.97,
+    meta_epochs: int        = 1000,
     shaping_scale: float    = 1.0,
     subgoal_threshold: float = float("inf"),
     potential_alpha: float  = 0.5,
+    state_projection_fn     = None,
     algo: str               = "SAC",
     eval_episodes: int      = 10,
     n_demos: int            = 5,
@@ -477,6 +478,8 @@ def main_meta_rl_loop(
         state_dim=state_dim,
         action_dim=action_dim,
         num_landmarks=num_landmarks,
+        state_projection_fn=state_projection_fn,
+        min_task_support=0.4,
         device=device, verbose=verbose,
     )
     metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
@@ -543,6 +546,7 @@ def main_meta_rl_loop(
                 gamma=gamma,
                 shaping_scale=shaping_scale,
                 subgoal_threshold=subgoal_threshold,
+                flush_buffer=True,
                 device=device, verbose=verbose,
                 training_state=training_state,
             )
@@ -594,11 +598,11 @@ def main_meta_rl_loop(
             skeleton = refine_skeleton(
                 skeleton, rb,
                 num_landmarks=num_landmarks,
+                state_projection_fn=state_projection_fn,
+                min_task_support=0.4,
                 device=device, verbose=verbose,
             )
             skeleton["_potential_stale"] = True
-            if training_state is not None:
-                training_state["is_buffer"] = None
             metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
             n_sub = len(skeleton["critical_states"])
             if verbose:

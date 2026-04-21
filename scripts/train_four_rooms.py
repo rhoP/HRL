@@ -479,7 +479,7 @@ def main(
     metrics = {
         "skeleton_train_losses": [],
         "phase3_success_rates":  [],
-        "phase4_returns":        [],
+        "phase4_losses":         [],
         "eval_success_rates":    [],
         "eval_returns":          [],
     }
@@ -506,9 +506,16 @@ def main(
     # Phase 1
     if verbose:
         print("\n[Phase 1] Building Morse skeleton...")
+    # State is (agent_x, agent_y, goal_x, goal_y).  Goal coordinates dominate
+    # inter-task distances and split the complex into disconnected manifolds, so
+    # landmark selection and witness-complex distances use only (x, y).
+    _pos_proj = lambda s: s[:2]  # noqa: E731
+
     skeleton = phase1_build_skeleton(rb,
                                      state_dim=STATE_DIM, action_dim=ACTION_DIM,
                                      num_landmarks=num_landmarks,
+                                     state_projection_fn=_pos_proj,
+                                     sa_epochs=0,
                                      device=device, verbose=verbose)
     skeleton["_potential_stale"] = True   # force Phase 2 build on first iteration
     metrics["skeleton_train_losses"].append(skeleton.get("train_losses", []))
@@ -585,10 +592,11 @@ def main(
                 gamma=gamma,
                 shaping_scale=shaping_scale,
                 subgoal_threshold=subgoal_threshold,
+                flush_buffer=True,
                 device=device, verbose=verbose,
                 training_state=training_state,
             )
-        metrics["phase4_returns"].append(p4_losses)
+        metrics["phase4_losses"].append(p4_losses)
 
         # Evaluate
         eval_result = evaluate_policy(
@@ -611,7 +619,7 @@ def main(
             skeleton_data=skeleton, replay_buffer=rb,
             metrics={
                 "eval": eval_result,
-                "p4_avg_return": float(np.mean(p4_losses)) if p4_losses else 0.0,
+                "p4_avg_loss": float(np.mean([e["total"] for e in p4_losses])) if p4_losses else 0.0,
             },
         )
         improved = tracker.update(eval_result["success_rate"], ckpt_dir)
@@ -656,6 +664,8 @@ def main(
                 print("[Refine] Rebuilding skeleton on enlarged buffer...")
             skeleton = refine_skeleton(skeleton, rb,
                                        num_landmarks=num_landmarks,
+                                       state_projection_fn=_pos_proj,
+                                       sa_epochs=0,
                                        device=device, verbose=verbose)
             skeleton["_potential_stale"] = True   # topology changed; rebuild potential next iter
             if training_state is not None:
@@ -705,7 +715,7 @@ if __name__ == "__main__":
     parser.add_argument("--tasks",        nargs="+", default=list(TASK_CONFIGS.keys()),
                         choices=list(TASK_CONFIGS.keys()),
                         help="Task keys to include (default: all A B C D)")
-    parser.add_argument("--iterations",   type=int, default=2)
+    parser.add_argument("--iterations",   type=int, default=5)
     parser.add_argument("--landmarks",    type=int, default=200)
     parser.add_argument("--meta-epochs",        type=int, default=200)
     parser.add_argument("--episodes-per-update", type=int, default=4,
@@ -724,7 +734,7 @@ if __name__ == "__main__":
                         help="Distance threshold for sparse shaping (inf = always shape)")
     parser.add_argument("--potential-alpha", type=float, default=0.5,
                         help="α for combined potential: α·skeleton + (1−α)·empirical (default: 0.5)")
-    parser.add_argument("--timesteps",    type=int,   default=10_000,
+    parser.add_argument("--timesteps",    type=int,   default=50_000,
                         help="PPO timesteps per task in Phase 0")
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--n-demos",      type=int, default=5)

@@ -534,7 +534,7 @@ def main(
     metrics = {
         "skeleton_train_losses": [],
         "phase3_success_rates":  [],
-        "phase4_returns":        [],
+        "phase4_losses":         [],
         "eval_success_rates":    [],
         "eval_returns":          [],
     }
@@ -640,10 +640,11 @@ def main(
                 gamma=gamma,
                 shaping_scale=shaping_scale,
                 subgoal_threshold=subgoal_threshold,
+                flush_buffer=True,
                 device=device, verbose=verbose,
                 training_state=training_state,
             )
-        metrics["phase4_returns"].append(p4_losses)
+        metrics["phase4_losses"].append(p4_losses)
 
         # Evaluate
         eval_result = evaluate_policy(
@@ -666,7 +667,7 @@ def main(
             skeleton_data=skeleton, replay_buffer=rb,
             metrics={
                 "eval": eval_result,
-                "p4_avg_return": float(np.mean(p4_losses)) if p4_losses else 0.0,
+                "p4_avg_loss": float(np.mean([e["total"] for e in p4_losses])) if p4_losses else 0.0,
             },
         )
         improved = tracker.update(eval_result["success_rate"], ckpt_dir)

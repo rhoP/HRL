@@ -805,15 +805,59 @@ def stratified_terminal_sampling(
     return pool
 
 
+def _check_topology_connectivity(simplices: dict, task_id: int, verbose: bool) -> int:
+    """
+    Return the number of connected components in the 1-skeleton.
+    Prints a warning when > 1 (disconnected complex → likely zero persistent
+    critical states; fix with state_projection_fn).
+    """
+    vertices: set = set()
+    for sigma in simplices.get(0, []):
+        vertices.update(sigma)
+    for sigma in simplices.get(1, []):
+        vertices.update(sigma)
+
+    if not vertices:
+        if verbose:
+            print(f"      WARNING: task {task_id} complex is empty (no vertices).")
+        return 0
+
+    adj: dict = {v: [] for v in vertices}
+    for u, v in simplices.get(1, []):
+        adj[u].append(v)
+        adj[v].append(u)
+
+    unvisited = set(vertices)
+    n_components = 0
+    while unvisited:
+        n_components += 1
+        stack = [next(iter(unvisited))]
+        while stack:
+            node = stack.pop()
+            if node in unvisited:
+                unvisited.discard(node)
+                stack.extend(adj[node])
+
+    if n_components > 1 and verbose:
+        n_edges = len(simplices.get(1, []))
+        print(f"      WARNING: task {task_id} complex has {n_components} disconnected "
+              f"components ({len(vertices)} vertices, {n_edges} edges). "
+              f"Persistent critical states will likely be 0 — check state_projection_fn.")
+
+    return n_components
+
+
 def _build_task_complex(
     task_id: int,
     landmark_states: torch.Tensor,
     replay_buffer,
     sa_encoder,
-    nu: int          = 1,
-    max_dim: int     = 1,
-    chunk_size: int  = 1024,
-    device: str      = "cpu",
+    nu: int                  = 1,
+    max_dim: int             = 1,
+    chunk_size: int          = 1024,
+    device: str              = "cpu",
+    state_projection_fn      = None,
+    task_episodes: list      = None,
 ) -> tuple:
     """
     Build witness complex for one task using SA-embedding-based neighbor distances.
@@ -821,6 +865,14 @@ def _build_task_complex(
     When sa_encoder is not None, both witness and landmark positions are
     projected into the joint (state, action) embedding space so that edges
     are only accepted when the action context is also consistent.
+
+    When state_projection_fn is provided and sa_encoder is None, witness and
+    landmark states are projected before distance computation.  Landmarks are
+    still stored in full-dimensional space; projection only affects neighbor
+    assignment.
+
+    task_episodes: pre-filtered list of episode dicts for this task_id.
+        When provided, skips scanning the full replay buffer.
     """
     n_landmarks = len(landmark_states)
     k  = min(max_dim + nu, n_landmarks)
@@ -828,9 +880,12 @@ def _build_task_complex(
 
     # Collect this task's (state, action) pairs
     task_states, task_actions = [], []
-    for ep in replay_buffer.iter_episodes():
-        if int(ep.get("task_id", 0)) != task_id:
-            continue
+    episodes_iter = (
+        task_episodes if task_episodes is not None
+        else (ep for ep in replay_buffer.iter_episodes()
+              if int(ep.get("task_id", 0)) == task_id)
+    )
+    for ep in episodes_iter:
         states  = np.asarray(ep["states"],  dtype=np.float32)
         actions = np.asarray(
             ep.get("actions", np.zeros((len(ep["rewards"]), 1), np.float32)),
@@ -857,8 +912,14 @@ def _build_task_complex(
             query_embs = sa_encoder(ts_t, ta_t).cpu()
             key_embs   = sa_encoder(lm.to(device), zero_acts).cpu()
     else:
-        query_embs = ts_t.cpu()
-        key_embs   = lm.cpu()
+        if state_projection_fn is not None:
+            proj_w     = np.stack([state_projection_fn(s) for s in task_states])
+            proj_lm    = np.stack([state_projection_fn(r) for r in lm.cpu().numpy()])
+            query_embs = torch.tensor(proj_w,  dtype=torch.float32)
+            key_embs   = torch.tensor(proj_lm, dtype=torch.float32)
+        else:
+            query_embs = ts_t.cpu()
+            key_embs   = lm.cpu()
 
     witness_count      = defaultdict(int)
     edge_action_sums   = {}
@@ -1072,6 +1133,7 @@ def build_meta_morse_complex(
     sa_lr: float                 = 1e-3,
     sa_epochs: int               = 5,
     knn_k: int                   = 10,
+    state_projection_fn          = None,
     device: str                  = "cpu",
     verbose: bool                = True,
 ) -> dict:
@@ -1101,10 +1163,16 @@ def build_meta_morse_complex(
             print("             No terminal episodes found; using all states for FPS.")
         pool_states = replay_buffer.get_all_states().cpu().numpy().tolist()
 
-    pool_t    = torch.tensor(np.array(pool_states, dtype=np.float32))
-    n_sel     = min(num_landmarks, len(pool_t))
-    lm_idx    = _fps_indices(pool_t, n_sel)
-    landmarks = pool_t[lm_idx]                   # [L, D]
+    pool_t = torch.tensor(np.array(pool_states, dtype=np.float32))
+    n_sel  = min(num_landmarks, len(pool_t))
+    # FPS on projected states so landmark coverage reflects the positional
+    # subspace rather than goal/task coordinates that inflate inter-task distances.
+    if state_projection_fn is not None:
+        pool_proj = np.stack([state_projection_fn(s) for s in pool_states])
+        lm_idx    = _fps_indices(torch.tensor(pool_proj, dtype=torch.float32), n_sel)
+    else:
+        lm_idx = _fps_indices(pool_t, n_sel)
+    landmarks = pool_t[lm_idx]                   # [L, full_D] — always full-dim
     landmark_meta = [{"task_ids": set(), "phi_norm": 0.0}] * len(landmarks)
     if verbose:
         print(f"             {len(landmarks)} landmarks selected.")
@@ -1125,9 +1193,14 @@ def build_meta_morse_complex(
         if verbose and sa_losses:
             print(f"             SA encoder final loss: {sa_losses[-1]:.4f}")
 
+    # ── Pre-index episodes by task_id (single O(N) pass, avoids O(N×T) scans) ──
+    _task_episode_cache: dict = {}
+    for _ep in replay_buffer.iter_episodes():
+        _tid_ep = int(_ep.get("task_id", 0))
+        _task_episode_cache.setdefault(_tid_ep, []).append(_ep)
+
     # ── Step 2: per-task complexes and Morse functions ────────────────────
-    unique_tasks = sorted({int(ep.get("task_id", 0))
-                           for ep in replay_buffer.iter_episodes()})
+    unique_tasks = sorted(_task_episode_cache.keys())
     if verbose:
         print(f"  [MetaMorse] Step 2: per-task analysis ({len(unique_tasks)} task(s))...")
 
@@ -1148,6 +1221,11 @@ def build_meta_morse_complex(
     task_phi_values:  dict = {}
     task_critical:    dict = {}
 
+    # Per-task complex cache: {tid: (t_simplices, t_stids, t_eal)}
+    # Populated in the analysis loop below and reused by the meta-union loop,
+    # eliminating the second full _build_task_complex pass per task.
+    _task_complex_cache: dict = {}
+
     # Kept for first-task representative (used in return dict for visualisation)
     _repr_simplices   = None
     _repr_stids       = None
@@ -1163,7 +1241,14 @@ def build_meta_morse_complex(
         t_simplices, t_stids, t_eal, t_states, t_neighbors = _build_task_complex(
             tid, landmark_states, replay_buffer,
             sa_encoder=sa_encoder, nu=nu, max_dim=max_dim, device=device,
+            state_projection_fn=state_projection_fn,
+            task_episodes=_task_episode_cache.get(tid, []),
         )
+
+        # ── Topology connectivity check ───────────────────────────────────
+        _check_topology_connectivity(t_simplices, tid, verbose)
+
+        _task_complex_cache[tid] = (t_simplices, t_stids, t_eal)
 
         # ── Witness-based simplex potential ───────────────────────────────
         wit_assignments = {i: list(t_neighbors[i]) for i in range(len(t_neighbors))}
@@ -1227,10 +1312,7 @@ def build_meta_morse_complex(
     seen:           set  = set()
 
     for tid in unique_tasks:
-        t_simplices, t_stids, t_eal, _, _ = _build_task_complex(
-            tid, landmark_states, replay_buffer,
-            sa_encoder=sa_encoder, nu=nu, max_dim=max_dim, device=device,
-        )
+        t_simplices, t_stids, t_eal = _task_complex_cache[tid]
         for d, sl in t_simplices.items():
             for sigma in sl:
                 if sigma not in seen:

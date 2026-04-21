@@ -246,6 +246,8 @@ def meta_policy_gradient_with_skeleton_shaping(
     is_buffer_size: int      = 16,
     is_clip_epsilon: float   = 0.2,
     replay_buffer            = None,
+    flush_buffer: bool       = False,
+    flush_optimizer: bool    = False,
     device: str              = "cpu",
     verbose: bool            = True,
     training_state: dict     = None,
@@ -268,10 +270,15 @@ def meta_policy_gradient_with_skeleton_shaping(
     episodes are not thrown away between calls.  Pass None on the first call;
     pass back the returned dict on subsequent calls.
 
+    `flush_buffer` should be True whenever the shaped-reward potential has
+    changed (i.e. every outer iteration), so that stale returns from the
+    previous potential do not corrupt the IS correction.  It discards the
+    episode buffer and clears Adam's first/second moment accumulators.
+
     Returns:
         meta_policy      — trained policy (same object, in-place)
         meta_value_net   — trained value baseline
-        epoch_losses     — list of per-epoch total losses
+        epoch_losses     — list of per-epoch loss component dicts
         training_state   — dict to pass back on the next call for continuity
     """
     meta_subgoals      = skeleton_data["meta_subgoals"]
@@ -296,6 +303,12 @@ def meta_policy_gradient_with_skeleton_shaping(
 
     is_buffer = (ts.get("is_buffer") or
                  TrajectoryBuffer(max_episodes=is_buffer_size))
+
+    if flush_buffer:
+        is_buffer = TrajectoryBuffer(max_episodes=is_buffer_size)
+
+    if flush_optimizer:
+        optimizer.state.clear()
 
     epoch_losses = []
     meta_policy.train()
@@ -365,7 +378,12 @@ def meta_policy_gradient_with_skeleton_shaping(
         torch.nn.utils.clip_grad_norm_(meta_value_net.parameters(), 1.0)
         optimizer.step()
 
-        epoch_losses.append(float(total_loss.item()))
+        epoch_losses.append({
+            "total":   float(total_loss.item()),
+            "policy":  float(policy_loss.item()),
+            "value":   float(value_loss.item()),
+            "entropy": float(entropy_loss.item()),
+        })
 
         if verbose and (epoch + 1) % eval_every == 0:
             sr = evaluate_meta_policy(

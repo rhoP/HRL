@@ -104,6 +104,8 @@ def save_checkpoint(
     if meta_policy is not None:
         torch.save(meta_policy.state_dict(),
                    os.path.join(ckpt_dir, "meta_policy.pt"))
+        with open(os.path.join(ckpt_dir, "model_config.json"), "w") as f:
+            json.dump({"gru_hidden": meta_policy.gru_hidden}, f)
     if meta_value_net is not None:
         torch.save(meta_value_net.state_dict(),
                    os.path.join(ckpt_dir, "meta_value_net.pt"))
@@ -167,6 +169,11 @@ def load_checkpoint(checkpoint_dir: str, device: str = "cpu") -> dict:
 
     _load = lambda p: torch.load(p, map_location=device, weights_only=False)
 
+    cfg_path = os.path.join(checkpoint_dir, "model_config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            result["model_config"] = json.load(f)
+
     mp_path = os.path.join(checkpoint_dir, "meta_policy.pt")
     if os.path.exists(mp_path):
         result["meta_policy_state"]    = _load(mp_path)
@@ -208,8 +215,10 @@ def restore_models(ckpt: dict, state_dim: int, action_dim: int,
     # Meta-policy
     meta_policy = meta_value_net = None
     if "meta_policy_state" in ckpt:
+        gru_hidden  = ckpt.get("model_config", {}).get("gru_hidden", 128)
         meta_policy = MetaPolicy(state_dim, action_dim,
-                                 discrete=discrete).to(device)
+                                 discrete=discrete,
+                                 gru_hidden=gru_hidden).to(device)
         meta_policy.load_state_dict(ckpt["meta_policy_state"])
         meta_policy.eval()
         meta_value_net = MetaValueNetwork(state_dim,

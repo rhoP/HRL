@@ -40,10 +40,9 @@ class MetaPolicy(nn.Module):
         self.gru_hidden = gru_hidden
         self.discrete   = discrete
 
-        # Each history step: [s ‖ a_encoded ‖ r]
-        # Discrete: a one-hot → action_dim; continuous: a flat → action_dim
         tau_step_dim = state_dim + action_dim + 1
-        self.gru = nn.GRU(tau_step_dim, gru_hidden, batch_first=True)
+        self.gru = (nn.GRU(tau_step_dim, gru_hidden, batch_first=True)
+                    if gru_hidden > 0 else None)
 
         head_in = state_dim + gru_hidden
         self.policy_head = nn.Sequential(
@@ -74,7 +73,7 @@ class MetaPolicy(nn.Module):
     def _encode_tau(self, tau: list, device) -> torch.Tensor:
         """Encode history list → context tensor [1, gru_hidden].  O(T) but
         rebuilds the full sequence from scratch; kept for backward compat."""
-        if not tau:
+        if self.gru_hidden == 0 or not tau:
             return torch.zeros(1, self.gru_hidden, device=device)
         steps = []
         for s, a, r in tau:
@@ -141,6 +140,8 @@ class MetaPolicy(nn.Module):
         else:
             s_arr = np.asarray(s, dtype=np.float32).flatten()
 
+        if self.gru_hidden == 0:
+            return h
         s_t   = torch.tensor(s_arr[: self.state_dim], dtype=torch.float32, device=device)
         a_t   = self._encode_action(a).to(device)
         r_t   = torch.tensor([float(r)], dtype=torch.float32, device=device)

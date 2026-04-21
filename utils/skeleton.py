@@ -35,6 +35,7 @@ def build_skeleton(
     sa_lr: float                 = 1e-3,
     sa_epochs: int               = 5,
     knn_k: int                   = 10,
+    state_projection_fn          = None,
     device: str                  = "cpu",
     verbose: bool                = True,
 ) -> dict:
@@ -74,6 +75,7 @@ def build_skeleton(
         sa_lr=sa_lr,
         sa_epochs=sa_epochs,
         knn_k=knn_k,
+        state_projection_fn=state_projection_fn,
         device=device,
         verbose=verbose,
     )

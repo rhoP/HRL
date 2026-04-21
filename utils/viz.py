@@ -97,7 +97,7 @@ def plot_training_curves(metrics: dict, save_dir: str) -> None:
     Output files (only written when data is present):
         metrics_phase2_td_loss.png/.tex
         metrics_phase3_success.png/.tex
-        metrics_phase4_returns.png/.tex
+        metrics_meta_loss.png/.tex  (via plot_meta_loss)
         metrics_eval.png/.tex
 
     skeleton_train_losses is intentionally omitted.
@@ -130,18 +130,8 @@ def plot_training_curves(metrics: dict, save_dir: str) -> None:
         _save_fig(fig, out)
         print(f"  [Viz] {out}")
 
-    if metrics.get("phase4_returns"):
-        fig, ax = plt.subplots(figsize=(6, 4))
-        for i, run in enumerate(metrics["phase4_returns"]):
-            if run:
-                ax.plot(run, color=_c(i), alpha=0.8, label=f"iter {i}")
-        ax.set_xlabel("epoch")
-        ax.set_ylabel("return")
-        ax.legend(fontsize=7)
-        fig.tight_layout()
-        out = os.path.join(save_dir, "metrics_phase4_returns.png")
-        _save_fig(fig, out)
-        print(f"  [Viz] {out}")
+    if metrics.get("phase4_losses"):
+        plot_meta_loss(metrics["phase4_losses"], save_dir)
 
     if metrics.get("eval_success_rates") or metrics.get("eval_returns"):
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -167,6 +157,69 @@ def plot_training_curves(metrics: dict, save_dir: str) -> None:
         out = os.path.join(save_dir, "metrics_eval.png")
         _save_fig(fig, out)
         print(f"  [Viz] {out}")
+
+
+# ── Meta-loss breakdown ────────────────────────────────────────────────────
+
+
+def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
+    """
+    Plot meta-policy gradient loss components across training epochs.
+
+    phase4_losses: list of iterations, each a list of per-epoch dicts with keys
+                   total / policy / value / entropy.
+    Writes metrics_meta_loss.png to save_dir.
+    """
+    if not phase4_losses:
+        return
+
+    # Normalise: accept both new dict format and legacy float list
+    def _extract(run, key):
+        out = []
+        for v in run:
+            if isinstance(v, dict):
+                out.append(v.get(key, float("nan")))
+            elif key == "total":
+                out.append(float(v))
+            else:
+                out.append(float("nan"))
+        return out
+
+    keys = ["total", "policy", "value", "entropy"]
+    labels = {"total": "total loss", "policy": "policy loss",
+              "value": "value loss", "entropy": "entropy"}
+    colors = {"total": _P["plum"], "policy": _P["blue"],
+              "value": _P["gold"], "entropy": _P["red"]}
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=False)
+    axes = axes.flatten()
+
+    for ax, key in zip(axes, keys):
+        for i, run in enumerate(phase4_losses):
+            if not run:
+                continue
+            y = _extract(run, key)
+            x = list(range(len(y)))
+            ax.plot(x, y, color=_c(i), alpha=0.75, linewidth=1.4,
+                    label=f"iter {i}")
+            # thin moving average
+            w = max(1, len(y) // 10)
+            if w > 1:
+                kernel = np.ones(w) / w
+                smooth = np.convolve(y, kernel, mode="valid")
+                ax.plot(range(w - 1, len(y)), smooth,
+                        color=colors[key], linewidth=2.0, linestyle="--")
+        ax.set_title(labels[key], fontsize=10)
+        ax.set_xlabel("epoch", fontsize=8)
+        ax.grid(alpha=0.25)
+        if len(phase4_losses) > 1:
+            ax.legend(fontsize=6)
+
+    fig.suptitle("Meta-policy gradient losses", fontsize=12, y=1.01)
+    fig.tight_layout()
+    out = os.path.join(save_dir, "metrics_meta_loss.png")
+    _save_fig(fig, out)
+    print(f"  [Viz] {out}")
 
 
 # ── Skeleton topology ──────────────────────────────────────────────────────
