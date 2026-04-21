@@ -164,7 +164,9 @@ def plot_training_curves(metrics: dict, save_dir: str) -> None:
 
 def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
     """
-    Plot meta-policy gradient loss components across training epochs.
+    Plot meta-policy gradient loss components as one continuous series across
+    all iterations.  Vertical dashed lines mark iteration boundaries;
+    small labels at the top of each panel identify the iteration number.
 
     phase4_losses: list of iterations, each a list of per-epoch dicts with keys
                    total / policy / value / entropy.
@@ -173,7 +175,6 @@ def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
     if not phase4_losses:
         return
 
-    # Normalise: accept both new dict format and legacy float list
     def _extract(run, key):
         out = []
         for v in run:
@@ -185,37 +186,68 @@ def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
                 out.append(float("nan"))
         return out
 
-    keys = ["total", "policy", "value", "entropy"]
-    labels = {"total": "total loss", "policy": "policy loss",
-              "value": "value loss", "entropy": "entropy"}
+    keys   = ["total", "policy", "value", "entropy"]
+    labels = {"total": "Total loss", "policy": "Policy loss",
+              "value": "Value loss", "entropy": "Entropy"}
     colors = {"total": _P["plum"], "policy": _P["blue"],
               "value": _P["gold"], "entropy": _P["red"]}
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=False)
+    # Concatenate all iterations into one flat series; record boundary positions
+    all_y: dict       = {k: [] for k in keys}
+    boundaries: list  = []   # global epoch index where each iteration ends
+    offset = 0
+    for run in phase4_losses:
+        if not run:
+            continue
+        for k in keys:
+            all_y[k].extend(_extract(run, k))
+        offset += len(run)
+        boundaries.append(offset)
+
+    if not all_y["total"]:
+        return
+
+    # The final boundary is just the end of data — don't draw a line there
+    iter_boundaries = boundaries[:-1]
+    n_epochs = len(all_y["total"])
+    x = list(range(n_epochs))
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
     axes = axes.flatten()
 
     for ax, key in zip(axes, keys):
-        for i, run in enumerate(phase4_losses):
-            if not run:
-                continue
-            y = _extract(run, key)
-            x = list(range(len(y)))
-            ax.plot(x, y, color=_c(i), alpha=0.75, linewidth=1.4,
-                    label=f"iter {i}")
-            # thin moving average
-            w = max(1, len(y) // 10)
-            if w > 1:
-                kernel = np.ones(w) / w
-                smooth = np.convolve(y, kernel, mode="valid")
-                ax.plot(range(w - 1, len(y)), smooth,
-                        color=colors[key], linewidth=2.0, linestyle="--")
-        ax.set_title(labels[key], fontsize=10)
-        ax.set_xlabel("epoch", fontsize=8)
-        ax.grid(alpha=0.25)
-        if len(phase4_losses) > 1:
-            ax.legend(fontsize=6)
+        y = np.array(all_y[key], dtype=float)
 
-    fig.suptitle("Meta-policy gradient losses", fontsize=12, y=1.01)
+        # Raw trace (thin, transparent)
+        ax.plot(x, y, color=colors[key], alpha=0.25, linewidth=0.7)
+
+        # Smoothed trace — window = ~5% of total length, min 5
+        w = max(5, n_epochs // 20)
+        if w < n_epochs:
+            kernel = np.ones(w) / w
+            smooth = np.convolve(y, kernel, mode="valid")
+            ax.plot(range(w - 1, n_epochs), smooth,
+                    color=colors[key], linewidth=2.0)
+
+        # Iteration boundary lines
+        for b in iter_boundaries:
+            ax.axvline(x=b, color=_P["mid"], linestyle="--",
+                       linewidth=0.9, alpha=0.7)
+
+        # Iteration labels just above the x-axis at each boundary
+        ylim = ax.get_ylim()
+        y_label = ylim[0] + (ylim[1] - ylim[0]) * 0.04
+        for i, b in enumerate(iter_boundaries):
+            ax.text(b + n_epochs * 0.005, y_label, f"iter {i + 1}→",
+                    fontsize=6, color=_P["mid"], va="bottom")
+
+        ax.set_title(labels[key], fontsize=10)
+        ax.set_xlabel("epoch (continuous across iterations)", fontsize=8)
+        ax.grid(alpha=0.25)
+
+    n_iters = len([r for r in phase4_losses if r])
+    fig.suptitle(f"Meta-policy gradient losses  ({n_iters} iteration(s), "
+                 f"{n_epochs} total epochs)", fontsize=11)
     fig.tight_layout()
     out = os.path.join(save_dir, "metrics_meta_loss.png")
     _save_fig(fig, out)

@@ -176,17 +176,13 @@ def phase0_collect_initial_data(
     algo: str = "SAC",
     device: str = "cpu",
     verbose: bool = True,
-) -> None:
+) -> dict:
     """
     Use SAC (or PPO) from stable_baselines3 to fill the replay buffer.
-
-    n_envs parallel copies of each task env are run simultaneously.
-    The SB3 model trains for timesteps_per_task total steps across all envs,
-    then a separate rollout of the same length collects transitions into
-    replay_buffer (steps_per_env = timesteps_per_task // n_envs per env so
-    total transitions ≈ timesteps_per_task).
+    Returns {task_id: model} so Phase 3 can continue training from these weights.
     """
     AlgoCls = SAC if algo.upper() == "SAC" else PPO
+    task_policies: dict = {}
 
     for task in task_distribution.tasks:
         if verbose:
@@ -201,10 +197,8 @@ def phase0_collect_initial_data(
         vec_env = make_vec_env(_make_env, n_envs=n_envs)
         model = AlgoCls("MlpPolicy", vec_env, verbose=0, device=device)
         model.learn(total_timesteps=timesteps_per_task)
+        task_policies[task.id] = model
 
-        # Collect transitions from all envs in parallel.
-        # VecEnv auto-resets on episode end — obs_next[i] is the reset obs when
-        # done[i] is True, so we never call vec_env.reset() manually here.
         obs = vec_env.reset()
         steps_per_env = max(1, timesteps_per_task // n_envs)
         for _ in range(steps_per_env):
@@ -212,7 +206,7 @@ def phase0_collect_initial_data(
             obs_next, reward, done, info = vec_env.step(action)
             for i in range(n_envs):
                 trunc_i = info[i].get("TimeLimit.truncated", False)
-                term_i = bool(done[i])  # and not trunc_i
+                term_i = bool(done[i])
                 replay_buffer.push(
                     obs[i],
                     action[i],
@@ -227,6 +221,7 @@ def phase0_collect_initial_data(
 
     if verbose:
         print(f"  [Phase 0] Buffer size: {len(replay_buffer)}")
+    return task_policies
 
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────
@@ -344,13 +339,14 @@ def phase3_train_task_policies(
     skeleton_data: dict,
     task_distribution: MetaWorldTaskDistribution,
     potential=None,
-    timesteps_per_task: int = 10_000,
-    shaping_scale: float = 1.0,
-    algo: str = "SAC",
-    device: str = "cpu",
-    verbose: bool = True,
-    save_dir: str = None,
-    iteration: int = 0,
+    timesteps_per_task: int      = 10_000,
+    shaping_scale: float         = 1.0,
+    algo: str                    = "SAC",
+    device: str                  = "cpu",
+    verbose: bool                = True,
+    save_dir: str                = None,
+    iteration: int               = 0,
+    existing_task_policies: dict = None,
 ) -> tuple:
     """
     Train one SB3 policy per task with potential-based shaped rewards.
@@ -379,8 +375,20 @@ def phase3_train_task_policies(
 
         cb = Phase3TrainingCallback()
         vec_env = make_vec_env(_make_env, n_envs=1)
-        model = AlgoCls("MlpPolicy", vec_env, verbose=0, device=device)
-        model.learn(total_timesteps=timesteps_per_task, callback=cb)
+
+        prior = (existing_task_policies or {}).get(task.id)
+        if prior is not None:
+            import tempfile
+            with tempfile.TemporaryDirectory() as _td:
+                prior.save(os.path.join(_td, "prior"))
+                model = type(prior).load(os.path.join(_td, "prior"),
+                                         env=vec_env, device=device)
+            model.learn(total_timesteps=timesteps_per_task,
+                        reset_num_timesteps=False, callback=cb)
+        else:
+            model = AlgoCls("MlpPolicy", vec_env, verbose=0, device=device)
+            model.learn(total_timesteps=timesteps_per_task, callback=cb)
+
         task_policies[task.id] = model
         vec_env.close()
 
@@ -515,13 +523,14 @@ def main_meta_rl_loop(
         if verbose:
             print("\n[Phase 0] Loading existing replay buffer...")
         rb = load_replay_buffer(rb_path, device=device)
+        task_policies = {}   # no Phase-0 models available; Phase 3 will create fresh
         if verbose:
             print(f"  Loaded {len(rb)} transitions.")
     else:
         rb = ReplayBuffer(device=device)
         if verbose:
             print("\n[Phase 0] Collecting initial data with SB3...")
-        phase0_collect_initial_data(
+        task_policies = phase0_collect_initial_data(
             task_distribution,
             rb,
             timesteps_per_task=timesteps_per_task,
@@ -558,7 +567,7 @@ def main_meta_rl_loop(
         plot_training_curves(metrics, save_dir)
         return None, None, skeleton, metrics
 
-    # Create meta-policy once; reuse and refine across iterations
+    # Create meta-policy once; task_policies and training_state carry across iterations
     meta_policy = MetaPolicy(state_dim, action_dim, discrete=discrete).to(device)
     meta_value_net = None
     training_state = None
@@ -582,7 +591,7 @@ def main_meta_rl_loop(
 
         # Phase 3
         if verbose:
-            print("[Phase 3] Training task policies with shaped rewards...")
+            print("[Phase 3] Training task policies (continuing from previous)...")
         task_policies, p3_stats = phase3_train_task_policies(
             skeleton,
             task_distribution,
@@ -594,6 +603,7 @@ def main_meta_rl_loop(
             verbose=verbose,
             save_dir=save_dir,
             iteration=iteration,
+            existing_task_policies=task_policies,
         )
         p3_sr = float(
             np.mean(
@@ -655,7 +665,7 @@ def main_meta_rl_loop(
             replay_buffer=rb,
             metrics={
                 "success_rate": sr,
-                "p4_avg_loss": float(np.mean(p4_losses)) if p4_losses else 0.0,
+                "p4_avg_loss": float(np.mean([e["total"] for e in p4_losses])) if p4_losses else 0.0,
             },
         )
         improved = tracker.update(sr, ckpt_dir)

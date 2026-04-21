@@ -168,8 +168,9 @@ def phase0_collect(
     timesteps_per_task: int = 10_000,
     device: str = "cpu",
     verbose: bool = True,
-) -> None:
-    """Use SB3 PPO (supports Discrete action spaces) to fill the replay buffer."""
+) -> dict:
+    """Train one PPO per task, collect into replay_buffer, return {task_id: model}."""
+    task_policies: dict = {}
     for task in task_distribution.tasks:
         if verbose:
             print(f"  [Phase 0] Collecting from {task.env_name} "
@@ -181,6 +182,7 @@ def phase0_collect(
         vec_env = make_vec_env(_make, n_envs=1)
         model   = PPO("MlpPolicy", vec_env, verbose=0, device=device)
         model.learn(total_timesteps=timesteps_per_task)
+        task_policies[task.id] = model
 
         obs = vec_env.reset()
         for _ in range(timesteps_per_task):
@@ -199,6 +201,7 @@ def phase0_collect(
 
     if verbose:
         print(f"  [Phase 0] Buffer size: {len(replay_buffer)}")
+    return task_policies
 
 
 # ── Phase 3: Per-task policies with shaped rewards ─────────────────────────
@@ -207,12 +210,13 @@ def phase3_train_task_policies(
     skeleton_data: dict,
     task_distribution: FourRoomsTaskDistribution,
     potential=None,
-    timesteps_per_task: int = 10_000,
-    shaping_scale: float    = 1.0,
-    device: str             = "cpu",
-    verbose: bool           = True,
-    save_dir: str           = None,
-    iteration: int          = 0,
+    timesteps_per_task: int      = 10_000,
+    shaping_scale: float         = 1.0,
+    device: str                  = "cpu",
+    verbose: bool                = True,
+    save_dir: str                = None,
+    iteration: int               = 0,
+    existing_task_policies: dict = None,
 ) -> tuple:
     """
     Train one PPO policy per task with potential-based shaped rewards.
@@ -238,8 +242,17 @@ def phase3_train_task_policies(
 
         cb      = Phase3TrainingCallback()
         vec_env = make_vec_env(_make_env, n_envs=1)
-        model   = PPO("MlpPolicy", vec_env, verbose=0, device=device)
-        model.learn(total_timesteps=timesteps_per_task, callback=cb)
+
+        prior = (existing_task_policies or {}).get(task.id)
+        if prior is not None:
+            prior.set_env(vec_env)
+            prior.learn(total_timesteps=timesteps_per_task,
+                        reset_num_timesteps=False, callback=cb)
+            model = prior
+        else:
+            model = PPO("MlpPolicy", vec_env, verbose=0, device=device)
+            model.learn(total_timesteps=timesteps_per_task, callback=cb)
+
         task_policies[task.id] = model
         vec_env.close()
 
@@ -492,13 +505,14 @@ def main(
         if verbose:
             print("\n[Phase 0] Loading existing replay buffer...")
         rb = load_replay_buffer(rb_path, device=device)
+        task_policies = {}   # no Phase-0 models available; Phase 3 will create fresh
     else:
         rb = ReplayBuffer(device=device)
         if verbose:
             print("\n[Phase 0] Collecting initial data with PPO...")
-        phase0_collect(task_distribution, rb,
-                       timesteps_per_task=timesteps_per_task,
-                       device=device, verbose=verbose)
+        task_policies = phase0_collect(task_distribution, rb,
+                                       timesteps_per_task=timesteps_per_task,
+                                       device=device, verbose=verbose)
         save_replay_buffer(rb, rb_path)
     if verbose:
         print(f"  Buffer: {len(rb)} transitions")
@@ -539,7 +553,6 @@ def main(
 
     meta_policy    = MetaPolicy(STATE_DIM, ACTION_DIM, discrete=True).to(device)
     meta_value_net = None
-    task_policies  = {}
     training_state = None   # carries meta_value_net / optimizer / is_buffer across iterations
 
     for iteration in range(num_iterations):
@@ -561,7 +574,7 @@ def main(
 
         # Phase 3 — one PPO policy per task with shaped rewards
         if verbose:
-            print("[Phase 3] Training task policies with shaped rewards...")
+            print("[Phase 3] Training task policies (continuing from previous)...")
         task_policies, p3_stats = phase3_train_task_policies(
             skeleton, task_distribution,
             potential=potential,
@@ -569,6 +582,7 @@ def main(
             shaping_scale=shaping_scale,
             device=device, verbose=verbose,
             save_dir=save_dir, iteration=iteration,
+            existing_task_policies=task_policies,
         )
         p3_sr = float(np.mean([np.mean(v["ep_successes"][-20:])
                                 for v in p3_stats.values()
@@ -715,7 +729,7 @@ if __name__ == "__main__":
     parser.add_argument("--tasks",        nargs="+", default=list(TASK_CONFIGS.keys()),
                         choices=list(TASK_CONFIGS.keys()),
                         help="Task keys to include (default: all A B C D)")
-    parser.add_argument("--iterations",   type=int, default=5)
+    parser.add_argument("--iterations",   type=int, default=3)
     parser.add_argument("--landmarks",    type=int, default=200)
     parser.add_argument("--meta-epochs",        type=int, default=200)
     parser.add_argument("--episodes-per-update", type=int, default=4,
