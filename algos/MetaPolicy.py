@@ -753,7 +753,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--potential-alpha",
         type=float,
-        default=0.0,
+        default=0.5,
         help="α for combined potential: α·skeleton + (1−α)·empirical (default: 0.5)",
     )
     parser.add_argument(
@@ -763,8 +763,8 @@ if __name__ == "__main__":
         help="parallel envs for Phase 0 data collection (default: 10)",
     )
     parser.add_argument("--algo", default="PPO", choices=["SAC", "PPO"])
-    parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--n-demos", type=int, default=2)
+    parser.add_argument("--eval-episodes", type=int, default=5)
+    parser.add_argument("--n-demos", type=int, default=10)
     parser.add_argument("--save-dir", default="results/meta_rl")
     parser.add_argument("--load", default=None, metavar="CKPT_DIR")
     parser.add_argument("--demo-only", action="store_true")
