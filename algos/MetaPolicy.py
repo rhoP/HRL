@@ -22,8 +22,6 @@ import numpy as np
 import torch
 
 
-torch.set_default_dtype(torch.float32)
-
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
@@ -68,6 +66,28 @@ from utils.viz import (
 
 MW_STATE_DIM = 39
 MW_ACTION_DIM = 4
+
+# ── MetaWorld task-agnostic state projection ───────────────────────────────
+# MetaWorld 39D observation layout (SawyerXYZEnv):
+#   obs[0:3]   = current end-effector XYZ
+#   obs[3]     = current gripper aperture
+#   obs[4:18]  = current object state (position, quaternion, padding) — TASK-SPECIFIC
+#   obs[18:21] = previous end-effector XYZ
+#   obs[21]    = previous gripper aperture
+#   obs[22:36] = previous object state — TASK-SPECIFIC
+#   obs[36:39] = target position (zeros in partial-obs mode)
+#
+# For cross-task skeleton building and reward shaping, project to the 8D
+# subspace with identical semantics across all manipulation tasks.  Object and
+# goal dimensions differ between reach and push, so including them pollutes
+# cross-task distances in landmark selection, DBSCAN subgoal clustering, and
+# the nearest-subgoal lookup used for online shaping.
+_MW_EE_INDICES: np.ndarray = np.array([0, 1, 2, 3, 18, 19, 20, 21], dtype=np.intp)
+
+
+def _mw_ee_projection(obs: np.ndarray) -> np.ndarray:
+    """Project a 39D MetaWorld obs to the 8D end-effector + gripper subspace."""
+    return obs[_MW_EE_INDICES]
 
 
 # ── Task / Distribution ────────────────────────────────────────────────────
@@ -171,6 +191,94 @@ class MetaWorldGymWrapper(gym.Env):
 # ── Phase 0 ────────────────────────────────────────────────────────────────
 
 
+def _get_scripted_policy(env_name: str):
+    """Return an instantiated MetaWorld scripted policy for env_name, or None.
+
+    MetaWorld scripted-policy classes follow the naming convention:
+        reach-v3        → SawyerReachV3Policy
+        push-v3         → SawyerPushV3Policy
+        pick-place-v3   → SawyerPickPlaceV3Policy
+    Returns None when the class is not found or instantiation fails.
+    """
+    try:
+        import metaworld.policies as _mwp
+    except ImportError:
+        return None
+    # "reach-v3" → ["reach", "v3"] → "ReachV3" → "SawyerReachV3Policy"
+    cls_name = "Sawyer" + "".join(p.capitalize() for p in env_name.split("-")) + "Policy"
+    cls = getattr(_mwp, cls_name, None)
+    if cls is None:
+        return None
+    try:
+        return cls()
+    except Exception:
+        return None
+
+
+def _collect_scripted_episodes(
+    task: "MetaWorldTask",
+    replay_buffer: ReplayBuffer,
+    n_episodes: int = 10,
+    max_steps: int = 500,
+    verbose: bool = True,
+) -> int:
+    """Roll out MetaWorld's scripted (expert) policy for task and push every
+    transition into replay_buffer.  Returns the number of successful episodes.
+
+    Scripted episodes guarantee coverage of the success region for each task.
+    This is critical for tasks like push-v3 where a cold-start SAC policy
+    almost never reaches the goal, leaving the empirical potential empty and
+    the DBSCAN subgoal clustering biased toward easier tasks.
+    """
+    policy = _get_scripted_policy(task.env_name)
+    if policy is None:
+        if verbose:
+            print(f"    [scripted] No scripted policy for {task.env_name}, skipping.")
+        return 0
+
+    n_success = 0
+    for _ in range(n_episodes):
+        env = task.create_env()
+        result = env.reset()
+        obs = result[0] if isinstance(result, tuple) else result
+        done = False
+        t = 0
+        ep_success = False
+
+        while not done and t < max_steps:
+            obs_arr = np.asarray(obs, dtype=np.float32).flatten()
+            try:
+                action = policy.get_action(obs_arr)
+            except Exception:
+                break
+            action_arr = np.asarray(action, dtype=np.float32).flatten()
+            obs_next, reward, terminated, truncated, info = env.step(action_arr)
+            done = terminated or truncated
+            replay_buffer.push(
+                obs_arr,
+                action_arr,
+                float(reward),
+                np.asarray(obs_next, dtype=np.float32).flatten(),
+                done,
+                task.id,
+                terminated=bool(terminated),
+            )
+            if info.get("success", False):
+                ep_success = True
+            obs = obs_next
+            t += 1
+        env.close()
+        if ep_success:
+            n_success += 1
+
+    if verbose:
+        print(
+            f"    [scripted] {task.env_name} (task {task.id}): "
+            f"{n_success}/{n_episodes} successful episodes"
+        )
+    return n_success
+
+
 def phase0_collect_initial_data(
     task_distribution: MetaWorldTaskDistribution,
     replay_buffer: ReplayBuffer,
@@ -178,10 +286,20 @@ def phase0_collect_initial_data(
     n_envs: int = 10,
     algo: str = "SAC",
     device: str = "cpu",
+    scripted_episodes: int = 10,
     verbose: bool = True,
 ) -> dict:
     """
-    Use SAC (or PPO) from stable_baselines3 to fill the replay buffer.
+    Fill the replay buffer for each task using two sources:
+
+    1. SB3 (SAC/PPO) — learns a policy and rolls it out, providing diverse
+       coverage of the state space including early-exploration transitions.
+    2. MetaWorld scripted policy — adds `scripted_episodes` successful expert
+       trajectories per task.  This is essential for tasks like push-v3 where
+       cold-start SAC rarely succeeds: without these, the empirical potential
+       has zero hitting trajectories for push, causing its shaping to collapse
+       to the (reach-biased) skeleton signal.
+
     Returns {task_id: model} so Phase 3 can continue training from these weights.
     """
     AlgoCls = SAC if algo.upper() == "SAC" else PPO
@@ -221,6 +339,15 @@ def phase0_collect_initial_data(
                 )
             obs = obs_next
         vec_env.close()
+
+        # Scripted-policy episodes — ensures successful trajectories exist in
+        # the buffer even when the SB3 policy hasn't solved the task yet.
+        if scripted_episodes > 0:
+            _collect_scripted_episodes(
+                task, replay_buffer,
+                n_episodes=scripted_episodes,
+                verbose=verbose,
+            )
 
     if verbose:
         print(f"  [Phase 0] Buffer size: {len(replay_buffer)}")
@@ -264,6 +391,7 @@ def phase2_build_potential(
     gamma: float = 0.99,
     hit_threshold: float = 0.5,
     verbose: bool = True,
+    state_projection_fn=None,
 ):
     """
     Build a CombinedPotential over the meta-skeleton.
@@ -296,7 +424,10 @@ def phase2_build_potential(
         skeleton_data.get("_potential_stale", True)
         or "_skel_potential_cached" not in skeleton_data
     ):
-        skel_pot = SkeletonPotential(lm_np, skeleton_data["simplices"], meta_subgoals)
+        skel_pot = SkeletonPotential(
+            lm_np, skeleton_data["simplices"], meta_subgoals,
+            state_projection_fn=state_projection_fn,
+        )
         skeleton_data["_skel_potential_cached"] = skel_pot
         skeleton_data["_potential_stale"] = False
         if verbose:
@@ -317,6 +448,7 @@ def phase2_build_potential(
         k=k,
         gamma=gamma,
         hit_threshold=hit_threshold,
+        state_projection_fn=state_projection_fn,
     )
     n_covered = sum(len(v) > 0 for v in emp_pot._trajs.values())
     if verbose:
@@ -324,6 +456,20 @@ def phase2_build_potential(
             f"  [Phase 2] EmpiricalHittingTimePotential (k={k}, γ={gamma}): "
             f"{n_covered}/{len(meta_subgoals)} subgoal(s) with hitting trajectories"
         )
+        # Per-subgoal, per-task support diagnostic — surfaces which tasks have
+        # zero hitting trajectories so shaping will be suppressed for them.
+        support = emp_pot.task_support_summary()
+        all_task_ids = sorted({tid for counts in support.values() for tid in counts})
+        for sg_id, counts in support.items():
+            covered = [f"task {t}:{counts[t]}" for t in all_task_ids if t in counts]
+            unsupported = [f"task {t}" for t in all_task_ids if t not in counts]
+            covered_str = ", ".join(covered) if covered else "none"
+            unsp_str    = ", ".join(unsupported) if unsupported else "none"
+            warn = "  ← WILL SUPPRESS SHAPING" if unsupported else ""
+            print(
+                f"    {sg_id}: supported by [{covered_str}]  "
+                f"unsupported: [{unsp_str}]{warn}"
+            )
 
     combined = CombinedPotential(skel_pot, emp_pot, lm_np, alpha=alpha)
     if verbose:
@@ -342,14 +488,15 @@ def phase3_train_task_policies(
     skeleton_data: dict,
     task_distribution: MetaWorldTaskDistribution,
     potential=None,
-    timesteps_per_task: int      = 10_000,
-    shaping_scale: float         = 1.0,
-    algo: str                    = "SAC",
-    device: str                  = "cpu",
-    verbose: bool                = True,
-    save_dir: str                = None,
-    iteration: int               = 0,
+    timesteps_per_task: int = 10_000,
+    shaping_scale: float = 1.0,
+    algo: str = "SAC",
+    device: str = "cpu",
+    verbose: bool = True,
+    save_dir: str = None,
+    iteration: int = 0,
     existing_task_policies: dict = None,
+    state_projection_fn=None,
 ) -> tuple:
     """
     Train one SB3 policy per task with potential-based shaped rewards.
@@ -370,10 +517,13 @@ def phase3_train_task_policies(
                 f"  [Phase 3] Training policy for {task.env_name} (task {task.id})..."
             )
 
-        def _make_env(t=task, pot=potential, scale=shaping_scale):
+        def _make_env(t=task, pot=potential, scale=shaping_scale,
+                      proj=state_projection_fn):
             env = MetaWorldGymWrapper(t)
             if pot is not None:
-                env = ShapedRewardWrapper(env, pot, shaping_scale=scale)
+                env = ShapedRewardWrapper(env, pot, shaping_scale=scale,
+                                          state_projection_fn=proj,
+                                          task_id=t.id)
             return env
 
         cb = Phase3TrainingCallback()
@@ -382,12 +532,17 @@ def phase3_train_task_policies(
         prior = (existing_task_policies or {}).get(task.id)
         if prior is not None:
             import tempfile
+
             with tempfile.TemporaryDirectory() as _td:
                 prior.save(os.path.join(_td, "prior"))
-                model = type(prior).load(os.path.join(_td, "prior"),
-                                         env=vec_env, device=device)
-            model.learn(total_timesteps=timesteps_per_task,
-                        reset_num_timesteps=False, callback=cb)
+                model = type(prior).load(
+                    os.path.join(_td, "prior"), env=vec_env, device=device
+                )
+            model.learn(
+                total_timesteps=timesteps_per_task,
+                reset_num_timesteps=False,
+                callback=cb,
+            )
         else:
             model = AlgoCls("MlpPolicy", vec_env, verbose=0, device=device)
             model.learn(total_timesteps=timesteps_per_task, callback=cb)
@@ -479,6 +634,7 @@ def main_meta_rl_loop(
     n_envs: int = 10,
     task_policy_steps: int = 10_000,
     collect_episodes: int = 20,
+    scripted_episodes: int = 10,
     gamma: float = 0.97,
     meta_epochs: int = 1000,
     shaping_scale: float = 1.0,
@@ -526,7 +682,7 @@ def main_meta_rl_loop(
         if verbose:
             print("\n[Phase 0] Loading existing replay buffer...")
         rb = load_replay_buffer(rb_path, device=device)
-        task_policies = {}   # no Phase-0 models available; Phase 3 will create fresh
+        task_policies = {}  # no Phase-0 models available; Phase 3 will create fresh
         if verbose:
             print(f"  Loaded {len(rb)} transitions.")
     else:
@@ -540,6 +696,7 @@ def main_meta_rl_loop(
             n_envs=n_envs,
             algo=algo,
             device=device,
+            scripted_episodes=scripted_episodes,
             verbose=verbose,
         )
         save_replay_buffer(rb, rb_path)
@@ -590,6 +747,7 @@ def main_meta_rl_loop(
             alpha=potential_alpha,
             gamma=gamma,
             verbose=verbose,
+            state_projection_fn=state_projection_fn,
         )
 
         # Phase 3
@@ -607,6 +765,7 @@ def main_meta_rl_loop(
             save_dir=save_dir,
             iteration=iteration,
             existing_task_policies=task_policies,
+            state_projection_fn=state_projection_fn,
         )
         p3_sr = float(
             np.mean(
@@ -668,7 +827,11 @@ def main_meta_rl_loop(
             replay_buffer=rb,
             metrics={
                 "success_rate": sr,
-                "p4_avg_loss": float(np.mean([e["total"] for e in p4_losses])) if p4_losses else 0.0,
+                "p4_avg_loss": (
+                    float(np.mean([e["total"] for e in p4_losses]))
+                    if p4_losses
+                    else 0.0
+                ),
             },
         )
         improved = tracker.update(sr, ckpt_dir)
@@ -757,7 +920,7 @@ if __name__ == "__main__":
     parser.add_argument("--tasks", nargs="+", default=_DEFAULT_TASKS, metavar="ENV")
     parser.add_argument("--max-tasks", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=5)
-    parser.add_argument("--landmarks", type=int, default=100)
+    parser.add_argument("--landmarks", type=int, default=200)
     parser.add_argument("--meta-epochs", type=int, default=500)
     parser.add_argument("--task-steps", type=int, default=10_000)
     parser.add_argument("--timesteps", type=int, default=50_000)
@@ -778,6 +941,13 @@ if __name__ == "__main__":
     parser.add_argument("--algo", default="PPO", choices=["SAC", "PPO"])
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--n-demos", type=int, default=10)
+    parser.add_argument(
+        "--scripted-episodes",
+        type=int,
+        default=10,
+        help="expert scripted-policy episodes per task added to the Phase 0 buffer "
+             "(default: 10; set 0 to disable)",
+    )
     parser.add_argument("--save-dir", default="results/meta_rl")
     parser.add_argument("--load", default=None, metavar="CKPT_DIR")
     parser.add_argument("--demo-only", action="store_true")
@@ -832,4 +1002,6 @@ if __name__ == "__main__":
             save_dir=args.save_dir,
             device=args.device,
             verbose=True,
+            state_projection_fn=_mw_ee_projection,
+            scripted_episodes=args.scripted_episodes,
         )

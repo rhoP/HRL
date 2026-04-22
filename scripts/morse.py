@@ -1214,8 +1214,9 @@ def _adaptive_dbscan_eps(positions: np.ndarray) -> float:
 def meta_critical_states(
     task_critical: dict,
     landmark_states_np: np.ndarray,
-    min_task_support: float = 0.6,
-    eps: float              = None,
+    min_task_support: float  = 0.6,
+    eps: float               = None,
+    state_projection_fn      = None,
 ) -> dict:
     """
     Soft intersection of per-task critical states via DBSCAN.
@@ -1226,6 +1227,14 @@ def meta_critical_states(
     eps: DBSCAN neighbourhood radius.  When None (default), computed
          automatically as median pairwise distance among critical vertices / 2,
          which adapts to the scale of the state space.
+
+    state_projection_fn: when provided, critical states are projected to the
+         task-agnostic subspace before DBSCAN clustering.  This prevents
+         task-specific dimensions (e.g. object position) from splitting
+         clusters that correspond to the same physical subgoal across tasks.
+         The subgoal centroid is stored in the projected space; all downstream
+         potential functions receive the same projection function so distances
+         are computed consistently.
     """
     try:
         from sklearn.cluster import DBSCAN
@@ -1246,19 +1255,31 @@ def meta_critical_states(
         return {}
 
     positions = np.array([c["state"] for c in all_crit], dtype=np.float32)
+
+    # Project positions for clustering when a projection is provided so that
+    # cross-task subgoals that correspond to the same arm configuration are
+    # merged even if their object/goal dimensions differ.
+    cluster_input = positions
+    if state_projection_fn is not None:
+        cluster_input = np.array(
+            [state_projection_fn(p) for p in positions], dtype=np.float32
+        )
+
     if eps is None:
-        eps = _adaptive_dbscan_eps(positions)
-    clustering = DBSCAN(eps=eps, min_samples=threshold).fit(positions)
+        eps = _adaptive_dbscan_eps(cluster_input)
+    clustering = DBSCAN(eps=eps, min_samples=threshold).fit(cluster_input)
 
     meta_sgs = {}
     for label in set(clustering.labels_):
         if label == -1:
             continue
         mask         = clustering.labels_ == label
-        cluster_pos  = positions[mask]
         unique_tasks = len({all_crit[i]["task_id"] for i, m in enumerate(mask) if m})
         if unique_tasks >= threshold:
-            centroid = cluster_pos.mean(axis=0)
+            # Centroid in projected space (or full space when no projection).
+            # Downstream potential functions receive state_projection_fn too,
+            # so all distance computations stay in the same coordinate system.
+            centroid = cluster_input[mask].mean(axis=0)
             meta_sgs[f"meta_sg_{label}"] = {
                 "state":        centroid,
                 "task_support": unique_tasks / num_tasks,
@@ -1541,6 +1562,7 @@ def build_meta_morse_complex(
         task_critical, lm_np,
         min_task_support=min_task_support,
         eps=dbscan_eps,
+        state_projection_fn=state_projection_fn,
     )
     if verbose:
         print(f"             {len(meta_subgoals)} meta-subgoal(s) before centrality filter.")

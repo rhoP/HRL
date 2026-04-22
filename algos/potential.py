@@ -28,12 +28,23 @@ def _to_numpy_f32(x) -> np.ndarray:
 
 # ── Nearest-subgoal lookup ─────────────────────────────────────────────────
 
-def _nearest_subgoal(s, meta_subgoals: dict):
-    """Return (sg_id, distance) of the meta-subgoal nearest to s."""
+def _nearest_subgoal(s, meta_subgoals: dict, state_projection_fn=None):
+    """Return (sg_id, distance) of the meta-subgoal nearest to s.
+
+    When state_projection_fn is provided both the query state and each
+    subgoal state are projected before computing L2 distance, so that
+    task-specific dimensions (e.g. object position) do not dominate the
+    nearest-subgoal assignment across tasks.
+    """
     s_arr = _to_numpy_f32(s).flatten()
+    if state_projection_fn is not None:
+        s_arr = state_projection_fn(s_arr)
     best_id, best_d = None, float("inf")
     for sg_id, sg_data in meta_subgoals.items():
-        d = float(np.linalg.norm(s_arr - _to_numpy_f32(sg_data["state"]).flatten()))
+        sg_state = _to_numpy_f32(sg_data["state"]).flatten()
+        if state_projection_fn is not None:
+            sg_state = state_projection_fn(sg_state)
+        d = float(np.linalg.norm(s_arr - sg_state))
         if d < best_d:
             best_d, best_id = d, sg_id
     return best_id, best_d
@@ -91,11 +102,27 @@ class SkeletonPotential:
     unit (hop count), so the distance is purely topological: the number of
     edges on the shortest path through the simplicial complex.  Distances are
     cached after first lookup.
+
+    When state_projection_fn is provided, nearest-landmark lookups and
+    subgoal-to-landmark assignments are computed in the projected subspace
+    rather than the full state space.  The graph structure (node / edge
+    indices) is not affected — projection only changes which landmark is
+    considered "nearest" to a given state.
     """
 
-    def __init__(self, landmarks, simplices: dict, meta_subgoals: dict):
+    def __init__(self, landmarks, simplices: dict, meta_subgoals: dict,
+                 state_projection_fn=None):
         self.landmarks = _to_numpy_f32(landmarks)
         self.subgoals  = meta_subgoals
+        self._proj     = state_projection_fn
+
+        # Pre-compute projected landmarks once if a projection is given
+        if state_projection_fn is not None:
+            self._proj_landmarks = np.stack(
+                [state_projection_fn(lm) for lm in self.landmarks]
+            )
+        else:
+            self._proj_landmarks = None
 
         self.G = nx.Graph()
         for i in range(len(self.landmarks)):
@@ -103,15 +130,31 @@ class SkeletonPotential:
         for edge in simplices.get(1, []):
             self.G.add_edge(edge[0], edge[1])   # unit weight — hop count
 
-        self._sg_landmarks: dict = {
-            sg_id: int(np.argmin(np.linalg.norm(
-                self.landmarks - _to_numpy_f32(sg_data["state"]).flatten(), axis=1
-            )))
-            for sg_id, sg_data in meta_subgoals.items()
-        }
+        # Map each meta-subgoal to its nearest landmark index.
+        # Use projected space when available so cross-task subgoals (which may
+        # have different object-dimension values) are matched by arm position.
+        if self._proj_landmarks is not None:
+            self._sg_landmarks: dict = {
+                sg_id: int(np.argmin(np.linalg.norm(
+                    self._proj_landmarks
+                    - state_projection_fn(_to_numpy_f32(sg_data["state"]).flatten()),
+                    axis=1,
+                )))
+                for sg_id, sg_data in meta_subgoals.items()
+            }
+        else:
+            self._sg_landmarks: dict = {
+                sg_id: int(np.argmin(np.linalg.norm(
+                    self.landmarks - _to_numpy_f32(sg_data["state"]).flatten(), axis=1
+                )))
+                for sg_id, sg_data in meta_subgoals.items()
+            }
         self._cache: dict = {}
 
     def _closest_landmark(self, s: np.ndarray) -> int:
+        if self._proj_landmarks is not None:
+            s_proj = self._proj(s)
+            return int(np.argmin(np.linalg.norm(self._proj_landmarks - s_proj, axis=1)))
         return int(np.argmin(np.linalg.norm(self.landmarks - s, axis=1)))
 
     def get_potential(self, s, sg_id) -> float:
@@ -137,39 +180,70 @@ class EmpiricalHittingTimePotential:
 
     Φ(s; c) = mean backward-discounted return of the k nearest hitting
     trajectories (by start state) that ever reached c.
+
+    When state_projection_fn is provided, hit detection and k-NN lookups
+    are performed in the projected subspace.  This prevents task-specific
+    observation dimensions (e.g. object position) from masking hits and
+    ensures that trajectories from different tasks are compared on a common
+    basis.  Start states and query states are both projected before indexing,
+    so the KDTree operates entirely in the projected space.
     """
 
     def __init__(
         self,
         replay_buffer,
         meta_subgoals: dict,
-        k: int             = 10,
-        gamma: float       = 0.99,
+        k: int               = 10,
+        gamma: float         = 0.99,
         hit_threshold: float = 0.5,
+        state_projection_fn  = None,
     ):
         self.k        = k
         self.gamma    = gamma
         self.subgoals = meta_subgoals
+        self._proj    = state_projection_fn
 
         self._trajs: dict = {sg_id: [] for sg_id in meta_subgoals}
+        # Per-task hit counts: {sg_id: {task_id: int}}
+        # Used by has_support() to guard shaping for tasks with no evidence.
+        self._task_hit_counts: dict = {sg_id: {} for sg_id in meta_subgoals}
+
+        # Pre-project subgoal states once
+        sg_states_cmp: dict = {}
+        for sg_id, sg_data in meta_subgoals.items():
+            sg_state = np.asarray(sg_data["state"], dtype=np.float32).flatten()
+            sg_states_cmp[sg_id] = (
+                state_projection_fn(sg_state) if state_projection_fn else sg_state
+            )
 
         for ep in replay_buffer.iter_episodes():
             states  = np.asarray(ep["states"],  dtype=np.float32)
             rewards = np.asarray(ep["rewards"], dtype=np.float32)
+            task_id = int(ep.get("task_id", 0))
             T = len(rewards)
-            for sg_id, sg_data in meta_subgoals.items():
-                sg_state = np.asarray(sg_data["state"], dtype=np.float32)
-                hit_idx  = None
+            for sg_id in meta_subgoals:
+                sg_cmp  = sg_states_cmp[sg_id]
+                hit_idx = None
                 for t in range(T):
-                    if np.linalg.norm(states[t + 1] - sg_state) < hit_threshold:
+                    s_next = states[t + 1].flatten()
+                    s_cmp  = (state_projection_fn(s_next)
+                               if state_projection_fn else s_next)
+                    if np.linalg.norm(s_cmp - sg_cmp) < hit_threshold:
                         hit_idx = t
                         break
                 if hit_idx is None:
                     continue
+                self._task_hit_counts[sg_id][task_id] = (
+                    self._task_hit_counts[sg_id].get(task_id, 0) + 1
+                )
                 n    = hit_idx + 1
                 exps = gamma ** np.arange(n - 1, -1, -1, dtype=np.float32)
+                # Store start state in projected space so the KDTree and
+                # get_potential queries are in the same coordinate system.
+                start = states[0].flatten()
                 self._trajs[sg_id].append({
-                    "start_state":     states[0].copy(),
+                    "start_state":     (state_projection_fn(start).copy()
+                                        if state_projection_fn else start.copy()),
                     "backward_return": float(np.dot(rewards[:n], exps)),
                 })
 
@@ -184,11 +258,22 @@ class EmpiricalHittingTimePotential:
                     [t["backward_return"] for t in trajs], dtype=np.float32
                 )
 
+    def has_support(self, sg_id, task_id: int) -> bool:
+        """Return True iff at least one hitting trajectory for sg_id came from task_id."""
+        return self._task_hit_counts.get(sg_id, {}).get(task_id, 0) > 0
+
+    def task_support_summary(self) -> dict:
+        """Return {sg_id: {task_id: hit_count}} for diagnostic logging."""
+        return {sg_id: dict(counts)
+                for sg_id, counts in self._task_hit_counts.items()}
+
     def get_potential(self, s, sg_id) -> float:
         tree = self._trees.get(sg_id)
         if tree is None:
             return 0.0
         s_arr = _to_numpy_f32(s).flatten()
+        if self._proj is not None:
+            s_arr = self._proj(s_arr)
         k     = min(self.k, len(self._back_rets[sg_id]))
         _, nn_idx = tree.query(s_arr, k=k)
         return float(np.mean(self._back_rets[sg_id][nn_idx]))
@@ -249,6 +334,14 @@ class CombinedPotential:
             return 1.0
         std = float(np.std(vals))
         return std if std > 1e-8 else 1.0
+
+    def has_empirical_support(self, sg_id, task_id: int) -> bool:
+        """Return True iff the empirical component has at least one hitting
+        trajectory for (sg_id, task_id).  Always True when the empirical
+        component is not an EmpiricalHittingTimePotential."""
+        if hasattr(self._emp, "has_support"):
+            return self._emp.has_support(sg_id, task_id)
+        return True
 
     def get_potential(self, s, sg_id) -> float:
         skel = self._skel.get_potential(s, sg_id) / self._skel_scale
@@ -520,22 +613,33 @@ class ShapedRewardWrapper(gym.Wrapper):
     """
     r_shaped = r_env + scale · [Φ(s'; c) − Φ(s; c)]
 
-    c is the nearest meta-subgoal to s'.  Shaping is skipped when the
-    nearest subgoal is farther than `threshold` (default: always shape).
+    c is the nearest meta-subgoal to s'.  Shaping is skipped when:
+      • the nearest subgoal is farther than `threshold` (default: always shape), OR
+      • task_id is provided and the potential has no empirical hitting trajectories
+        for (sg_id, task_id) — prevents a reach-biased skeleton from corrupting
+        reward signals for push or other tasks that never reached the subgoal.
+
+    When state_projection_fn is provided it is forwarded to _nearest_subgoal
+    so that cross-task subgoal assignment uses the task-agnostic projected
+    subspace rather than the raw observation.
     """
 
     def __init__(
         self,
         env,
         potential,
-        shaping_scale: float = 1.0,
-        threshold: float     = float("inf"),
+        shaping_scale: float  = 1.0,
+        threshold: float      = float("inf"),
+        state_projection_fn   = None,
+        task_id: int          = None,
     ):
         super().__init__(env)
-        self._potential     = potential
-        self._shaping_scale = shaping_scale
-        self._threshold     = threshold
-        self._last_obs      = None
+        self._potential            = potential
+        self._shaping_scale        = shaping_scale
+        self._threshold            = threshold
+        self._state_projection_fn  = state_projection_fn
+        self._task_id              = task_id
+        self._last_obs             = None
 
     def reset(self, **kwargs):
         obs, info      = self.env.reset(**kwargs)
@@ -548,15 +652,29 @@ class ShapedRewardWrapper(gym.Wrapper):
         r_env = float(r)
         r_int = 0.0
         if self._last_obs is not None:
-            sg_id, dist = _nearest_subgoal(obs_arr, self._potential.subgoals)
+            sg_id, dist = _nearest_subgoal(
+                obs_arr, self._potential.subgoals, self._state_projection_fn,
+            )
             if sg_id is not None and dist <= self._threshold:
-                r_int = self._potential.get_intrinsic_reward(
-                    self._last_obs, obs_arr, sg_id,
-                )
-                if not np.isfinite(r_int):
-                    r_int = 0.0
-                r = r_env + self._shaping_scale * r_int
-        info["r_env"]     = r_env
-        info["r_shaping"] = r_int
+                # Skip shaping when this task has no empirical evidence for the
+                # nearest subgoal.  A skeleton built from an easier task would
+                # otherwise inject a misleading gradient for the harder task.
+                has_support = True
+                if self._task_id is not None and hasattr(
+                    self._potential, "has_empirical_support"
+                ):
+                    has_support = self._potential.has_empirical_support(
+                        sg_id, self._task_id
+                    )
+                if has_support:
+                    r_int = self._potential.get_intrinsic_reward(
+                        self._last_obs, obs_arr, sg_id,
+                    )
+                    if not np.isfinite(r_int):
+                        r_int = 0.0
+                    r = r_env + self._shaping_scale * r_int
+        info["r_env"]          = r_env
+        info["r_shaping"]      = r_int
+        info["shaping_active"] = r_int != 0.0
         self._last_obs = obs_arr
         return obs, float(r), terminated, truncated, info
