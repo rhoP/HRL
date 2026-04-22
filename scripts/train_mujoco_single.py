@@ -115,7 +115,7 @@ def phase0_bootstrap(
     # populate info["TimeLimit.truncated"] across all Gymnasium versions,
     # which would silently mark every survived episode as failed.
     collect_steps = max(5_000, total_steps // n_envs * 2)
-    _collect_transitions(model, env_id, replay_buffer, n_steps=collect_steps)
+    _collect_transitions(model, env_id, replay_buffer, n_steps=collect_steps, deterministic=True)
     if verbose:
         print(f"  [Phase 0] Buffer: {len(replay_buffer)} transitions "
               f"({collect_steps} collection steps)")
@@ -143,13 +143,24 @@ def phase1_build_skeleton(
 ) -> dict:
     """Build Morse skeleton from replay buffer using only survived trajectories."""
     if verbose:
-        n_eps     = len(replay_buffer._ep_ends)
+        n_eps = len(replay_buffer._ep_ends)
+        ep_list = list(replay_buffer.iter_episodes())
         n_survived = sum(
-            1 for ep in replay_buffer.iter_episodes()
-            if not any(np.asarray(ep.get("terminated", ep["dones"]), dtype=bool))
+            1 for ep in ep_list
+            if not any(np.asarray(ep["terminated"], dtype=bool))
         )
-        print(f"  [Phase 1] Building Morse skeleton  landmarks={num_landmarks}"
-              f"  episodes={n_eps}  survived={n_survived}")
+        ep_lengths = [len(ep["rewards"]) for ep in ep_list]
+        if ep_lengths:
+            near_surv = sum(1 for l in ep_lengths if l > 0.9 * max(ep_lengths))
+            print(
+                f"  [Phase 1] Building Morse skeleton  landmarks={num_landmarks}"
+                f"  episodes={n_eps}  survived={n_survived}"
+                f"  ep_len min={min(ep_lengths)} median={int(np.median(ep_lengths))}"
+                f" max={max(ep_lengths)}  near_surv(>90%max)={near_surv}"
+            )
+        else:
+            print(f"  [Phase 1] Building Morse skeleton  landmarks={num_landmarks}"
+                  f"  episodes={n_eps}  survived={n_survived}")
     skeleton = build_skeleton(
         replay_buffer,
         state_dim=state_dim,
@@ -350,12 +361,13 @@ def _collect_transitions(
     replay_buffer: ReplayBuffer,
     n_steps: int = 2_000,
     task_id: int = 0,
+    deterministic: bool = False,
 ) -> None:
-    """Roll out model (deterministic=False) and push raw-reward transitions."""
+    """Roll out model and push raw-reward transitions."""
     env = gym.make(env_id)
     obs, _ = env.reset()
     for _ in range(n_steps):
-        action, _ = model.predict(obs, deterministic=False)
+        action, _ = model.predict(obs, deterministic=deterministic)
         obs_next, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         replay_buffer.push(
@@ -375,95 +387,87 @@ def _plot_training_curve(all_stats: list, save_dir: str) -> None:
       returns_shaped.png     — shaped return (env + shaping bonus)
       returns_shaping.png    — shaping bonus only
 
-    all_stats entries may include a "label" key (e.g. "bootstrap", "iter 1").
-    The bootstrap segment is shaded distinctly; iteration boundaries are marked
-    with dashed vertical lines.
+    X-axis is in iteration units: bootstrap occupies [-1, 0] (labeled 0),
+    iter 1 occupies [0, 1] (labeled 1), iter 2 occupies [1, 2] (labeled 2),
+    etc.  Episodes within each segment are uniformly spread across that unit
+    interval.  Integer boundary marks fall at 0, 1, 2, ...
     """
     def _build_segs(key):
-        x_off, segs, labels, bounds = 0, [], [], []
-        for seg_stats in all_stats:
+        segs, labels = [], []
+        for seg_idx, seg_stats in enumerate(all_stats):
             vals = seg_stats.get(key, [])
             n = len(vals)
-            if n == 0:
-                continue
-            xs = list(range(x_off, x_off + n))
-            segs.append((xs, vals))
-            labels.append(seg_stats.get("label", ""))
-            x_off += n
-            bounds.append(x_off)
-        return segs, labels, bounds
+            # bootstrap (seg_idx=0) → [-1, 0]; iter k (seg_idx=k) → [k-1, k]
+            base = seg_idx - 1
+            xs = [base + (j + 0.5) / n for j in range(n)] if n > 0 else []
+            segs.append((xs, list(vals)))
+            labels.append(seg_idx)   # 0 = bootstrap, 1 = iter 1, ...
+        return segs, labels
 
-    env_segs,     env_labels,  env_bounds  = _build_segs("ep_env_rewards")
-    shaped_segs,  _,           _           = _build_segs("ep_rewards")
-    shaping_segs, _,           _           = _build_segs("ep_shaping")
+    n_segs = len(all_stats)
+    if n_segs == 0:
+        return
 
-    if not env_segs:
+    env_segs,     env_labels  = _build_segs("ep_env_rewards")
+    shaped_segs,  _           = _build_segs("ep_rewards")
+    shaping_segs, _           = _build_segs("ep_shaping")
+
+    if not any(xs for xs, _ in env_segs):
         return
 
     panel_cfg = [
-        (env_segs,     env_labels, env_bounds, "env return",    "Env returns (task reward)",    "returns_env.png"),
-        (shaped_segs,  env_labels, env_bounds, "shaped return", "Shaped returns (env + bonus)", "returns_shaped.png"),
-        (shaping_segs, env_labels, env_bounds, "shaping bonus", "Shaping bonus only",           "returns_shaping.png"),
+        (env_segs,     env_labels, "Raw return",    "returns_env.png"),
+        (shaped_segs,  env_labels, "Shaped return", "returns_shaped.png"),
+        (shaping_segs, env_labels, "Shaping bonus", "returns_shaping.png"),
     ]
 
-    for segs, seg_labels, bounds, ylabel, title, fname in panel_cfg:
-        fig, ax = plt.subplots(figsize=(10, 4))
+    # Ticks at segment centres: -0.5 (bootstrap=0), 0.5 (iter 1), 1.5 (iter 2) ...
+    tick_positions  = [seg_idx - 0.5 for seg_idx in range(n_segs)]
+    tick_labels_raw = [str(seg_idx) for seg_idx in range(n_segs)]
 
-        if not segs:
-            ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                    transform=ax.transAxes, fontsize=10)
-            ax.set_title(title)
-            fig.tight_layout()
-            _save_fig(fig, os.path.join(save_dir, fname))
-            continue
+    for segs, seg_labels, ylabel, fname in panel_cfg:
+        fig, ax = plt.subplots(figsize=(max(8, n_segs * 1.5), 4))
 
         all_xs = [x for xs, _ in segs for x in xs]
         all_vs = [v for _, vs in segs for v in vs]
 
-        # Draw each phase segment; bootstrap gets grey, iterations get colours.
+        if not all_xs:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10)
+            fig.tight_layout()
+            _save_fig(fig, os.path.join(save_dir, fname))
+            continue
+
+        # Raw per-episode traces; bootstrap (label 0) grey, iterations in palette.
         for i, (xs, vs) in enumerate(segs):
-            is_bootstrap = seg_labels[i] == "bootstrap"
-            color = "#888888" if is_bootstrap else _c(i)
+            if not xs:
+                continue
+            color = "#5F5966" if seg_labels[i] == 0 else _c(i)
             ax.plot(xs, vs, color=color, alpha=0.18, linewidth=0.7)
 
-        # Continuous rolling mean over all episodes.
+        # Continuous rolling mean (window in episode-space).
         w = max(5, len(all_vs) // 20)
         if len(all_vs) >= w:
             smooth = np.convolve(all_vs, np.ones(w) / w, mode="valid")
             ax.plot(all_xs[w - 1:], smooth, color=_P["blue"], linewidth=2.0,
                     label=f"rolling mean (w={w})")
 
-        # Per-segment mean markers.
-        seg_means = [float(np.mean(vs)) for _, vs in segs]
-        seg_mid_x = [int(np.mean(xs)) for xs, _ in segs]
-        ax.scatter(seg_mid_x, seg_means, color=_P["gold"], s=50, zorder=5,
-                   label="segment mean")
+        # Per-segment mean dot at segment centre.
+        for i, (xs, vs) in enumerate(segs):
+            if not vs:
+                continue
+            ax.scatter([i - 0.5], [float(np.mean(vs))],
+                       color=_P["gold"], s=50, zorder=5)
 
-        # Vertical boundary lines between segments.
-        for b in bounds[:-1]:
+        # Vertical boundary lines at 0, 1, 2, ... (between segments).
+        for b in range(n_segs - 1):
             ax.axvline(b, color=_P["red"], linewidth=0.8, linestyle="--", alpha=0.5)
 
-        # Segment labels along the top.
-        iter_counter = 0
-        prev = 0
-        for i, b in enumerate(bounds):
-            lbl = seg_labels[i]
-            if not lbl:
-                iter_counter += 1
-                lbl = f"iter {iter_counter}"
-            elif lbl != "bootstrap":
-                iter_counter += 1
-            is_bootstrap = lbl == "bootstrap"
-            color = "#888888" if is_bootstrap else _c(i)
-            mid = (prev + b) / 2
-            ax.text(mid, 0.97, lbl, ha="center", va="top",
-                    fontsize=6, color=color,
-                    transform=ax.get_xaxis_transform())
-            prev = b
-
-        ax.set_xlabel("episode")
+        ax.set_xlabel("Iteration")
         ax.set_ylabel(ylabel)
-        ax.set_title(title)
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels_raw, fontsize=8)
+        ax.set_xlim(-1.05, n_segs - 1 + 0.05)
         ax.legend(fontsize=7, loc="upper left")
         fig.tight_layout()
         out = os.path.join(save_dir, fname)
@@ -527,10 +531,10 @@ def main():
     # Progress-estimation shaping
     parser.add_argument("--use-progress",        action="store_true",
                         help="Add learned progress-estimation reward shaping")
-    parser.add_argument("--progress-latent-dim", type=int,   default=64,
-                        help="Encoder latent dim for progress estimator (default: 64)")
-    parser.add_argument("--progress-epochs",     type=int,   default=10,
-                        help="Training epochs for progress estimator (default: 10)")
+    parser.add_argument("--progress-latent-dim", type=int,   default=128,
+                        help="Encoder latent dim for progress estimator (default: 128)")
+    parser.add_argument("--progress-epochs",     type=int,   default=20,
+                        help="Training epochs for progress estimator (default: 20)")
     parser.add_argument("--progress-weight",     type=float, default=0.5,
                         help="Fraction of shaping from progress vs base (default: 0.5)")
     args = parser.parse_args()

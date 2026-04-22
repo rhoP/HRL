@@ -345,8 +345,6 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer, save_path: str) -
         zorder=4,
         label="landmarks",
     )
-    # plt.colorbar(sc, ax=ax, label="Morse value", fraction=0.03)
-
     # Critical states — project centroid arrays, not landmark indices
     c_ids = list(critical_states.keys())
     if c_ids:
@@ -370,24 +368,29 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer, save_path: str) -
     #                textcoords="offset points", fontsize=8,
     #                color=_P["red"])
 
-    # ax.set_title("Witness Complex & Discrete Morse Function (PCA projection)")
-    # ax.set_xlabel("PC 1"); ax.set_ylabel("PC 2")
     ax.axis("off")
-
-    # legend_handles = [
-    #    mpatches.Patch(color=_P["light"], label="collected states"),
-    #    mpatches.Patch(color=_P["blue"], alpha=0.5, label="2-simplices"),
-    #    mpatches.Patch(color=_P["blue"], label="1-simplices"),
-    #    plt.Line2D([0], [0], marker="o", color="w",
-    #               markerfacecolor=_P["mid"], markersize=7, label="landmarks (Morse)"),
-    #    plt.Line2D([0], [0], marker="o", color="w",
-    #               markerfacecolor="none", markeredgecolor=_P["red"],
-    #               markersize=10, markeredgewidth=2, label="critical states"),
-    # ]
-    # ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
     fig.tight_layout()
     _save_fig(fig, save_path)
     print(f"  [Viz] Skeleton topology saved → {save_path}")
+
+    # Standalone colorbar
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    stem = os.path.splitext(save_path)[0]
+    cb_path = stem + "_colorbar.png"
+    fig_cb, ax_cb = plt.subplots(figsize=(0.55, 3.5))
+    fig_cb.colorbar(
+        ScalarMappable(
+            norm=Normalize(vmin=float(mv_arr.min()), vmax=float(mv_arr.max())),
+            cmap=CMAP_DIV,
+        ),
+        cax=ax_cb,
+        label="Morse value",
+    )
+    fig_cb.tight_layout()
+    _save_fig(fig_cb, cb_path)
+    print(f"  [Viz] Colorbar → {cb_path}")
 
 
 # ── Policy evaluation ──────────────────────────────────────────────────────

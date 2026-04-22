@@ -276,10 +276,10 @@ class KNNBackwardEstimator:
     survived_only=True   ← MuJoCo locomotion mode
         Use episodes that survived to the time limit (no terminated=True step),
         because in MuJoCo terminated=True means failure (falling), not success.
-        Importance-sampling fallback: when fewer than `min_survived` such
-        episodes exist, all episodes are included but each step is weighted by
-          w(τ) = max(0, R(τ)) / R_max
-        so high-return (near-successful) episodes dominate.
+        Fallback chain when fewer than `min_survived` episodes survive:
+          1. Near-survivor episodes (length >= 90% of max episode length) — no IS weighting.
+          2. IS fallback over all episodes weighted by max(0, R(τ)) / R_max
+             if no near-survivors exist either.
 
     Parameters
     ----------
@@ -296,7 +296,7 @@ class KNNBackwardEstimator:
         gamma: float        = 0.99,
         k: int              = 10,
         survived_only: bool = False,
-        min_survived: int   = 3,
+        min_survived: int   = 1,
     ):
         self.gamma = gamma
         self.k     = k
@@ -329,9 +329,14 @@ class KNNBackwardEstimator:
             if len(survived_eps) >= min_survived:
                 selected = survived_eps
             else:
-                # IS fallback: include all but weight by return
-                selected       = all_eps
-                use_is_weights = True
+                max_T      = max((e["T"] for e in all_eps), default=1)
+                near_surv  = [e for e in all_eps if e["T"] >= 0.9 * max_T]
+                if near_surv:
+                    selected = near_surv
+                else:
+                    # IS fallback: include all but weight by return
+                    selected       = all_eps
+                    use_is_weights = True
         else:
             # Original behaviour: use episodes with at least one terminated step
             selected = [e for e in all_eps if any(e["term_flags"])]

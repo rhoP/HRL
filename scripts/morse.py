@@ -891,7 +891,7 @@ def stratified_terminal_sampling(
     gamma: float        = 0.99,
     strata: int         = 5,
     survived_only: bool = False,
-    min_survived: int   = 3,
+    min_survived: int   = 1,
 ) -> list:
     """
     Sample states from multiple return strata to cover the full state space,
@@ -932,13 +932,24 @@ def stratified_terminal_sampling(
             candidates    = surv
             use_is_weight = False
         else:
-            candidates    = ep_info
-            use_is_weight = True
-            print(
-                f"  [WARNING] stratified_terminal_sampling: only {len(surv)} survived "
-                f"episode(s) found (need min_survived={min_survived}); "
-                f"using IS-weighted fallback over all {len(ep_info)} episodes."
-            )
+            max_T       = max(e["T"] for e in ep_info)
+            near_surv   = [e for e in ep_info if e["T"] >= 0.9 * max_T]
+            if near_surv:
+                candidates    = near_surv
+                use_is_weight = False
+                print(
+                    f"  [WARNING] stratified_terminal_sampling: only {len(surv)} survived "
+                    f"episode(s) found; using {len(near_surv)} near-survivor episode(s) "
+                    f"(length >= 90% of max={max_T}) as fallback."
+                )
+            else:
+                candidates    = ep_info
+                use_is_weight = True
+                print(
+                    f"  [WARNING] stratified_terminal_sampling: only {len(surv)} survived "
+                    f"episode(s) found (need min_survived={min_survived}); "
+                    f"using IS-weighted fallback over all {len(ep_info)} episodes."
+                )
     else:
         candidates    = ep_info
         use_is_weight = False
