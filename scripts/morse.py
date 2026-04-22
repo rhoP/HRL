@@ -82,15 +82,7 @@ class CollectorAdapter:
 
 
 def _fps_indices(points: torch.Tensor, n: int, start_idx: int = None) -> list:
-    """
-    Farthest-point sampling on `points` [N, D].  Returns a list of n
-    selected indices into points.  Shared by select_landmarks and
-    select_landmarks_task_aware.
-
-    start_idx: if given, FPS begins at this index instead of a random point.
-        Useful when the caller wants to anchor the selection to a specific
-        point (e.g. a terminal state) and expand outward from there.
-    """
+    """Farthest-point sampling fallback — used only inside spectral helpers."""
     N = len(points)
     n = min(n, N)
     if n == 0:
@@ -106,6 +98,112 @@ def _fps_indices(points: torch.Tensor, n: int, start_idx: int = None) -> list:
     return indices
 
 
+def spectral_landmark_selection(
+    encoded_states: torch.Tensor,
+    num_landmarks: int,
+) -> torch.Tensor:
+    """
+    Select landmarks as centroids of spectral clusters.
+
+    Adaptive: n_neighbors = clamp(sqrt(N), 5, 50) so the affinity graph stays
+    well-connected as the dataset grows without over-smoothing small datasets.
+    Falls back to FPS when sklearn is unavailable or the graph is disconnected.
+
+    Args:
+        encoded_states : [N, D] float32 tensor
+        num_landmarks  : number of desired clusters
+
+    Returns:
+        [K, D] float32 tensor of cluster centroids, K ≤ num_landmarks.
+    """
+    from sklearn.cluster import SpectralClustering as _SC
+
+    n = len(encoded_states)
+    k = min(num_landmarks, n)
+    if k == 0:
+        return encoded_states.float()[:0]
+    if k == n:
+        return encoded_states.float()
+
+    n_neighbors = int(min(50, max(5, n ** 0.5)))
+    n_neighbors = min(n_neighbors, n - 1)
+
+    try:
+        labels = _SC(
+            n_clusters=k,
+            affinity='nearest_neighbors',
+            n_neighbors=n_neighbors,
+            assign_labels='kmeans',
+            random_state=42,
+            n_jobs=-1,
+        ).fit_predict(encoded_states.cpu().float().numpy())
+    except Exception:
+        return encoded_states[_fps_indices(encoded_states, k)].float()
+
+    pts = encoded_states.float()
+    landmarks = []
+    for i in range(k):
+        cluster = pts[labels == i]
+        if len(cluster) > 0:
+            landmarks.append(cluster.mean(dim=0))
+        else:
+            landmarks.append(pts[torch.randint(0, n, (1,)).item()])
+    return torch.stack(landmarks)
+
+
+def _spectral_indices(states_t: torch.Tensor, n: int) -> list:
+    """
+    Run spectral clustering on states_t and return one representative index
+    per cluster (the actual state nearest to each cluster centroid).
+
+    Drop-in for _fps_indices where real state indices are needed so that
+    associated metadata can be fetched by position.  Falls back to FPS when
+    spectral clustering fails.
+    """
+    from sklearn.cluster import SpectralClustering as _SC
+
+    N = len(states_t)
+    n = min(n, N)
+    if n == 0:
+        return []
+    if n == N:
+        return list(range(N))
+
+    n_neighbors = int(min(50, max(5, N ** 0.5)))
+    n_neighbors = min(n_neighbors, N - 1)
+    arr = states_t.cpu().float().numpy()
+
+    try:
+        labels = _SC(
+            n_clusters=n,
+            affinity='nearest_neighbors',
+            n_neighbors=n_neighbors,
+            assign_labels='kmeans',
+            random_state=42,
+            n_jobs=-1,
+        ).fit_predict(arr)
+    except Exception:
+        return _fps_indices(states_t, n)
+
+    pts     = states_t.float()
+    indices = []
+    used:   set = set()
+    for i in range(n):
+        mask_idx = np.where(labels == i)[0]
+        if len(mask_idx) == 0:
+            fallback = next((j for j in range(N) if j not in used), 0)
+            indices.append(fallback)
+            used.add(fallback)
+            continue
+        cluster_pts = pts[mask_idx]
+        centroid    = cluster_pts.mean(dim=0)
+        local_best  = int((cluster_pts - centroid).pow(2).sum(-1).argmin().item())
+        best        = int(mask_idx[local_best])
+        indices.append(best)
+        used.add(best)
+    return indices
+
+
 def _normalize_rewards_array(rewards, reward_normalizer) -> np.ndarray:
     """Normalise a reward array, or return a copy if no normalizer."""
     arr = np.asarray(rewards, dtype=np.float32)
@@ -116,10 +214,9 @@ def _normalize_rewards_array(rewards, reward_normalizer) -> np.ndarray:
 
 
 def select_landmarks(replay_buffer, num_landmarks=500, distance_metric='euclidean'):
-    """Selects landmark states using farthest-point sampling."""
+    """Select landmark states as spectral-cluster centroids."""
     all_states = replay_buffer.get_all_states()   # [N, state_dim]
-    idxs = _fps_indices(all_states, num_landmarks)
-    return all_states[idxs]                       # [L, state_dim]
+    return spectral_landmark_selection(all_states, num_landmarks)
 
 
 def select_landmarks_task_aware(
@@ -130,26 +227,25 @@ def select_landmarks_task_aware(
     action_window: int = 1,
 ) -> tuple:
     """
-    Two-step task-aware landmark selection (see module docstring).
+    Two-step task-aware landmark selection.
 
-    Step 1 — Terminal-state return pooling with cluster smoothing.
+    Step 1 — Terminal-state return pooling with spectral cluster smoothing.
         For each terminal episode compute the full normalised discounted
         return.  R_0 = mean of those returns.  For every episode, states
         at positions where the per-step backward return >= R_0 are pooled.
-        The pool is then clustered via FPS-seeded nearest-neighbour
-        assignment; each state's phi_norm is replaced by the mean Φ of its
-        cluster, smoothing the landscape without losing spatial diversity.
+        Spectral clustering partitions the pool; each state's phi_norm is
+        replaced by its cluster mean, smoothing the Φ landscape while
+        preserving spatial diversity.
 
-    Step 2 — Per-task backward state + action-context FPS.
-        For each task, episodes are iterated backwards (terminal → start)
-        so the FPS is anchored to goal-proximate states first and expands
-        toward the episode start.  Context vectors are (state ∥
-        mean_action_window) so two fragments with similar states but
-        different required actions produce distinct landmarks.  phi_norm is
-        set to the normalised backward return at the selected position.
+    Step 2 — Per-task backward state + action-context spectral selection.
+        For each task, episodes are iterated backwards (terminal → start).
+        Context vectors are (state ∥ mean_action_window) so two fragments
+        with similar states but different required actions form distinct
+        clusters.  phi_norm is set to the normalised backward return at the
+        selected position.
 
-    A final FPS pass over the merged pool produces exactly `num_landmarks`
-    diverse landmarks.
+    A final spectral pass over the merged pool produces exactly
+    `num_landmarks` diverse landmarks.
 
     Returns:
         landmark_states : [L, state_dim] float32 tensor
@@ -201,16 +297,31 @@ def select_landmarks_task_aware(
             pool_meta.append({"task_ids": {task_id},
                                "phi_norm": float(backward_returns[t])})
 
-    # ── Step 1 k-NN clustering: smooth phi_norm within spatial clusters ────
-    # FPS selects k cluster seeds from the pool; each pool state is assigned
-    # to its nearest seed; phi_norm is replaced by the cluster mean, making
-    # the Φ landscape smoother without reducing the pool's spatial coverage.
+    # ── Step 1 spectral clustering: smooth phi_norm within spatial clusters ──
+    # Spectral clustering partitions the pool; each state's phi_norm is
+    # replaced by its cluster mean, smoothing the Φ landscape without losing
+    # spatial diversity.
     if len(pool_states) > 1:
+        from sklearn.cluster import SpectralClustering as _SC
+
         pool_t     = torch.tensor(np.array(pool_states, dtype=np.float32))
         n_clusters = min(num_landmarks, len(pool_states))
-        seed_idx   = _fps_indices(pool_t, n_clusters)
-        centers    = pool_t[seed_idx]                                   # [K, D]
-        assignments = torch.cdist(pool_t, centers).argmin(dim=1).tolist()
+        n_nb       = int(min(50, max(5, len(pool_states) ** 0.5)))
+        n_nb       = min(n_nb, len(pool_states) - 1)
+        try:
+            assignments = _SC(
+                n_clusters=n_clusters,
+                affinity='nearest_neighbors',
+                n_neighbors=n_nb,
+                assign_labels='kmeans',
+                random_state=42,
+                n_jobs=-1,
+            ).fit_predict(pool_t.numpy()).tolist()
+        except Exception:
+            # Fallback: FPS-seeded nearest-neighbour assignment
+            seed_idx    = _fps_indices(pool_t, n_clusters)
+            centers     = pool_t[seed_idx]
+            assignments = torch.cdist(pool_t, centers).argmin(dim=1).tolist()
 
         phi_sums = [0.0] * n_clusters
         phi_cnts = [0]   * n_clusters
@@ -254,9 +365,9 @@ def select_landmarks_task_aware(
                 G = float(norm_r[t]) + gamma * G
                 backward_returns[t] = G
 
-            # Iterate backwards: terminal states enter ctx_vecs first so the
-            # FPS seed (index 0) is anchored to a goal-proximate state and
-            # expands toward the episode start.
+            # Iterate backwards so that goal-proximate states come first in
+            # ctx_vecs; spectral clustering will naturally form a cluster
+            # around them when they are geometrically distinct.
             for t in range(T - 1, -1, -1):
                 lo = max(0, t - action_window)
                 hi = min(T, t + action_window + 1)
@@ -270,12 +381,12 @@ def select_landmarks_task_aware(
 
         ctx_t  = torch.tensor(np.array(ctx_vecs, dtype=np.float32))
         n_task = max(1, min(num_landmarks // max(1, len(unique_tasks)), len(ctx_t)))
-        lm_idx = _fps_indices(ctx_t, n_task, start_idx=0)
+        lm_idx = _spectral_indices(ctx_t, n_task)
         for idx in lm_idx:
             step2_states.append(orig_states[idx])
             step2_meta.append({"task_ids": {tid}, "phi_norm": phi_norms_s2[idx]})
 
-    # ── Final FPS over merged pool ────────────────────────────────────────
+    # ── Final spectral pass over merged pool ─────────────────────────────
     all_states_list = pool_states + step2_states
     all_meta_list   = pool_meta   + step2_meta
     if not all_states_list:
@@ -285,7 +396,7 @@ def select_landmarks_task_aware(
 
     all_t   = torch.tensor(np.array(all_states_list, dtype=np.float32))
     n_sel   = min(num_landmarks, len(all_t))
-    sel_idx = _fps_indices(all_t, n_sel)
+    sel_idx = _spectral_indices(all_t, n_sel)
     return all_t[sel_idx], [all_meta_list[i] for i in sel_idx]
 
 
@@ -421,21 +532,41 @@ def compute_simplex_potential(simplex_vertices, landmark_states_np, knn_estimato
     return float(np.mean(vals)) if vals else 0.0
 
 
+def compute_marginal_potential(simplex: tuple, phi_values: dict, faces: list) -> float:
+    """
+    Marginal potential used for critical-simplex identification.
+
+        f_morse(σ) = Φ(σ) − mean_{ν ⊂ σ} Φ(ν)
+
+    For a vertex (dim 0) there are no faces, so f_morse(v) = Φ(v).
+    For higher dimensions the marginal measures how much Φ rises *beyond*
+    the average potential of its boundary faces, making it invariant to the
+    global scale of Φ and directly comparable across dimensions.
+    """
+    phi_sigma = phi_values.get(simplex, 0.0)
+    if not faces:
+        return phi_sigma
+    face_phis = [phi_values.get(f, 0.0) for f in faces]
+    return phi_sigma - sum(face_phis) / len(face_phis)
+
+
 def compute_morse_function(simplices, landmark_states, knn_estimator, task_ids,
                            witness_potential=None):
     """
     Compute the discrete Morse function on all simplices using k-NN potentials.
 
-    phi_values  — potential estimates for every simplex.
-      dim 0     : k-NN backward-return at the landmark vertex.
-      dim ≥ 1   : witness-based mean Φ when witness_potential is provided,
-                  otherwise vertex-mean k-NN (legacy path).
+    phi_values   — raw potential Φ(σ) for every simplex.
+      dim 0      : k-NN backward-return at the landmark vertex.
+      dim ≥ 1    : witness-based mean Φ when witness_potential is provided,
+                   otherwise vertex-mean k-NN (legacy path).
 
-    morse_values — Discrete Morse function used for critical-simplex detection:
+    morse_values — Marginal potential used for critical-simplex detection:
 
-        dim 0  f(v) = Φ(v)
-        dim 1  f(u→v) = |Φ(v) − Φ(u)|   (gradient magnitude)
-        dim ≥2 f(σ) = Φ(σ) − mean{ f(τ) : τ face of σ }
+        f_morse(σ) = Φ(σ) − mean_{ν ⊂ σ} Φ(ν)
+
+        dim 0  f(v)   = Φ(v)
+        dim 1  f(e)   = Φ(e) − ½[Φ(u) + Φ(v)]
+        dim ≥2 f(σ)   = Φ(σ) − mean{ Φ(τ) : τ codim-1 face of σ }
 
     Parameters
     ----------
@@ -467,7 +598,7 @@ def compute_morse_function(simplices, landmark_states, knn_estimator, task_ids,
                 )
 
     # Ensure orphan vertices (present in edges but not as 0-simplices) have
-    # phi entries so edge gradients are computed correctly.
+    # phi entries so marginal potentials of edges are computed correctly.
     all_verts = {v for sl in simplices.values() for s in sl for v in s}
     for v in all_verts:
         if (v,) not in phi_values:
@@ -478,21 +609,14 @@ def compute_morse_function(simplices, landmark_states, knn_estimator, task_ids,
                     (v,), lm_np, knn_estimator, task_ids
                 )
 
-    # ── Phase 2: Discrete Morse function ─────────────────────────────────
+    # ── Phase 2: Marginal potential (Discrete Morse function) ─────────────
     morse_values: dict = {}
     for dim, simplex_list in simplices.items():
         for simplex in simplex_list:
-            if dim == 0:
-                morse_values[simplex] = phi_values[simplex]
-            elif dim == 1:
-                u, v = simplex
-                morse_values[simplex] = abs(phi_values[(v,)] - phi_values[(u,)])
-            else:
-                faces      = get_faces(simplex)
-                face_morse = [morse_values.get(f, phi_values.get(f, 0.0))
-                              for f in faces]
-                morse_values[simplex] = (phi_values[simplex]
-                                         - sum(face_morse) / len(face_morse))
+            faces = get_faces(simplex) if dim > 0 else []
+            morse_values[simplex] = compute_marginal_potential(
+                simplex, phi_values, faces
+            )
 
     return morse_values, phi_values
 
@@ -516,14 +640,13 @@ def identify_critical_simplices(simplices, morse_values, threshold_percentile=90
       (b) No face  γ ⊂ c of dimension dim(c)-1 satisfies Φ(γ) > Φ(c).
           Equivalently: all faces have Φ(γ) ≤ Φ(c), or c has no faces.
 
-    Interpretation by dimension (with the edge gradient formula in place):
-      dim 0 — vertex is critical when all adjacent edges have higher or equal
-               Morse value (i.e. it is a potential minimum — no edge pulls away
-               from it downhill).
-      dim 1 — edge is critical when both endpoint values ≤ edge gradient AND
-               all incident triangles have gradient ≥ edge value (saddle).
-      dim 2 — triangle is critical when all edge values ≤ triangle value and
-               there are no cofaces (local maximum of the Morse function).
+    Interpretation by dimension (using marginal potential f_morse = Φ(σ) − mean Φ(faces)):
+      dim 0 — vertex is critical when it is a local minimum: all adjacent
+               edges have higher or equal marginal potential.
+      dim 1 — edge is critical (saddle) when its marginal value exceeds both
+               endpoint values and all incident triangles.
+      dim 2 — triangle is critical (local maximum) when all edge marginals
+               are ≤ the triangle's marginal and there are no cofaces.
 
     threshold_percentile: optional magnitude gate — keeps only critical
         simplices whose |Φ| exceeds this percentile of all |Φ| values.
@@ -765,42 +888,91 @@ def visualize_morse_complex(
 
 def stratified_terminal_sampling(
     replay_buffer,
-    gamma: float = 0.99,
-    strata: int  = 5,
+    gamma: float        = 0.99,
+    strata: int         = 5,
+    survived_only: bool = False,
+    min_survived: int   = 3,
 ) -> list:
     """
     Sample states from multiple return strata to cover the full state space,
     including bottleneck regions.  Returns list of np.ndarray states from
     the midpoint to the end of each trajectory in each stratum.
-    """
-    episodes     = list(replay_buffer.iter_episodes())
-    traj_returns = []
-    for ep in episodes:
-        if not ep["dones"][-1]:
-            traj_returns.append(None); continue
-        rw = np.asarray(ep["rewards"], dtype=np.float32)
-        T  = len(rw)
-        G  = float(np.sum(rw * (gamma ** np.arange(T - 1, -1, -1, dtype=np.float32))))
-        traj_returns.append(G)
 
-    valid = [(i, r) for i, r in enumerate(traj_returns) if r is not None]
-    if not valid:
+    survived_only=True  (MuJoCo mode)
+        Only use episodes that survived to the time limit (no early termination
+        via terminated=True, which signals failure in MuJoCo locomotion tasks).
+        IS fallback: if fewer than `min_survived` such episodes exist, include
+        all episodes and repeat state contributions proportionally to their
+        normalised return so that high-return near-successful trajectories
+        dominate landmark placement.
+    """
+    episodes = list(replay_buffer.iter_episodes())
+
+    ep_info = []
+    for ep in episodes:
+        rw     = np.asarray(ep["rewards"], dtype=np.float32)
+        T      = len(rw)
+        if T == 0:
+            continue
+        assert "terminated" in ep, (
+            "Episode dict is missing 'terminated' key — check that all "
+            "replay_buffer.push() calls pass terminated= explicitly."
+        )
+        term_f   = np.asarray(ep["terminated"], dtype=bool)
+        survived = not any(term_f)
+        G        = float(np.dot(rw, gamma ** np.arange(T - 1, -1, -1, dtype=np.float32)))
+        ep_info.append({"ep": ep, "G": G, "survived": survived, "T": T})
+
+    if not ep_info:
         return []
 
-    vals = np.array([r for _, r in valid])
-    qs   = np.percentile(vals, np.linspace(0, 100, strata + 1))
+    if survived_only:
+        surv = [e for e in ep_info if e["survived"]]
+        if len(surv) >= min_survived:
+            candidates    = surv
+            use_is_weight = False
+        else:
+            candidates    = ep_info
+            use_is_weight = True
+            print(
+                f"  [WARNING] stratified_terminal_sampling: only {len(surv)} survived "
+                f"episode(s) found (need min_survived={min_survived}); "
+                f"using IS-weighted fallback over all {len(ep_info)} episodes."
+            )
+    else:
+        candidates    = ep_info
+        use_is_weight = False
 
+    returns = np.array([e["G"] for e in candidates])
+    if use_is_weight:
+        max_R   = float(np.clip(returns.max(), 1e-8, None))
+        weights = np.clip(returns, 0.0, None) / max_R
+        w_min, w_max = float(weights.min()), float(weights.max())
+        print(
+            f"  [WARNING] IS weight range: [{w_min:.3f}, {w_max:.3f}]"
+            + ("  ← near-uniform; gamma may be too low for episode length" if w_max - w_min < 0.1 else "")
+        )
+    else:
+        weights = np.ones(len(candidates))
+
+    qs  = np.percentile(returns, np.linspace(0, 100, strata + 1))
     pool = []
     for si in range(strata):
         lo = qs[si]
         hi = qs[si + 1] + (1e-6 if si == strata - 1 else 0.0)
-        for ep_idx, ret in valid:
-            if lo <= ret < hi:
-                ep      = episodes[ep_idx]
-                states  = np.asarray(ep["states"], dtype=np.float32)
-                T       = len(ep["rewards"])
-                mid_idx = T // 2
-                for t in range(mid_idx, T):
+        for i, info in enumerate(candidates):
+            if not (lo <= info["G"] < hi):
+                continue
+            w = weights[i]
+            if w == 0.0:
+                continue
+            ep     = info["ep"]
+            states = np.asarray(ep["states"], dtype=np.float32)
+            T      = info["T"]
+            mid_i  = T // 2
+            repeats = max(1, round(w * strata)) if use_is_weight else 1
+            for _ in range(repeats):
+                for t in range(mid_i, T):
                     pool.append(states[t])
     return pool
 
@@ -964,15 +1136,15 @@ def _build_task_complex(
 
 def _persistent_critical_simplices(
     simplices: dict,
-    phi_values: dict,
+    morse_values: dict,
     persistence_threshold: float = 0.05,
 ) -> dict:
     """
-    Forman-critical simplices filtered by a persistence gap.
+    Forman-critical simplices filtered by a persistence gap on the marginal potential.
 
     A simplex c survives iff:
-      min coface phi ≥ phi(c) + persistence_threshold   (no near-cancelling coface)
-      max face  phi ≤ phi(c) - persistence_threshold    (no near-cancelling face)
+      min coface f_morse ≥ f_morse(c) + persistence_threshold
+      max face   f_morse ≤ f_morse(c) - persistence_threshold
     """
     coface_dict: dict = {}
     face_dict:   dict = {}
@@ -988,16 +1160,16 @@ def _persistent_critical_simplices(
 
     for dim, simplex_list in simplices.items():
         for sigma in simplex_list:
-            if sigma not in phi_values:
+            if sigma not in morse_values:
                 continue
-            val = phi_values[sigma]
+            val = morse_values[sigma]
 
             cofaces     = coface_dict.get(sigma, [])
-            coface_vals = [phi_values[b] for b in cofaces if b in phi_values]
+            coface_vals = [morse_values[b] for b in cofaces if b in morse_values]
             cond_a      = (not coface_vals) or (min(coface_vals) >= val + persistence_threshold)
 
             faces     = face_dict.get(sigma, [])
-            face_vals = [phi_values[g] for g in faces if g in phi_values]
+            face_vals = [morse_values[g] for g in faces if g in morse_values]
             cond_b    = (not face_vals) or (max(face_vals) <= val - persistence_threshold)
 
             if cond_a and cond_b:
@@ -1006,17 +1178,43 @@ def _persistent_critical_simplices(
     return critical
 
 
+def _adaptive_dbscan_eps(positions: np.ndarray) -> float:
+    """
+    Data-driven DBSCAN eps: median pairwise L2 distance between critical
+    vertices divided by 2.  Scales automatically with the state-space geometry
+    so that neighbouring critical states in the same topological basin cluster
+    together regardless of absolute observation magnitudes.
+
+    Falls back to 0.5 when fewer than 2 positions are available.
+    """
+    n = len(positions)
+    if n < 2:
+        return 0.5
+    # Use at most 200 points to keep cost O(n^2) bounded.
+    sample = positions if n <= 200 else positions[
+        np.random.default_rng(0).choice(n, 200, replace=False)
+    ]
+    dists = np.linalg.norm(sample[:, None] - sample[None, :], axis=-1)
+    # Upper triangle only (excluding diagonal zeros).
+    upper = dists[np.triu_indices(len(sample), k=1)]
+    return float(np.median(upper)) / 2.0
+
+
 def meta_critical_states(
     task_critical: dict,
     landmark_states_np: np.ndarray,
     min_task_support: float = 0.6,
-    eps: float              = 0.5,
+    eps: float              = None,
 ) -> dict:
     """
     Soft intersection of per-task critical states via DBSCAN.
 
     task_critical: {task_id: {v_id: np.ndarray state}}
     Returns {sg_id: {'state': centroid, 'task_support': float, 'num_tasks': int}}
+
+    eps: DBSCAN neighbourhood radius.  When None (default), computed
+         automatically as median pairwise distance among critical vertices / 2,
+         which adapts to the scale of the state space.
     """
     try:
         from sklearn.cluster import DBSCAN
@@ -1036,7 +1234,9 @@ def meta_critical_states(
     if not all_crit:
         return {}
 
-    positions  = np.array([c["state"] for c in all_crit], dtype=np.float32)
+    positions = np.array([c["state"] for c in all_crit], dtype=np.float32)
+    if eps is None:
+        eps = _adaptive_dbscan_eps(positions)
     clustering = DBSCAN(eps=eps, min_samples=threshold).fit(positions)
 
     meta_sgs = {}
@@ -1136,6 +1336,8 @@ def build_meta_morse_complex(
     state_projection_fn          = None,
     device: str                  = "cpu",
     verbose: bool                = True,
+    survived_only: bool          = False,
+    dbscan_eps: float            = None,
 ) -> dict:
     """
     Full Meta-MorseComplex pipeline (Meta-MorseComplex.md).
@@ -1156,23 +1358,32 @@ def build_meta_morse_complex(
     # ── Step 1: landmark selection ────────────────────────────────────────
     if verbose:
         print("  [MetaMorse] Step 1: stratified terminal sampling...")
-    pool_states = stratified_terminal_sampling(replay_buffer, gamma=gamma, strata=5)
+    pool_states = stratified_terminal_sampling(
+        replay_buffer, gamma=gamma, strata=5,
+        survived_only=survived_only,
+    )
 
     if not pool_states:
         if verbose:
-            print("             No terminal episodes found; using all states for FPS.")
+            print("             No survived episodes found; using all states for spectral selection.")
         pool_states = replay_buffer.get_all_states().cpu().numpy().tolist()
 
     pool_t = torch.tensor(np.array(pool_states, dtype=np.float32))
     n_sel  = min(num_landmarks, len(pool_t))
-    # FPS on projected states so landmark coverage reflects the positional
-    # subspace rather than goal/task coordinates that inflate inter-task distances.
+    # Spectral clustering on projected states so coverage reflects the
+    # positional subspace rather than goal/task coordinates that would
+    # inflate inter-task distances.  Map each cluster centroid back to the
+    # nearest actual full-dimensional state so landmarks are always in the
+    # original state space (required by the SA encoder and KNN estimator).
     if state_projection_fn is not None:
-        pool_proj = np.stack([state_projection_fn(s) for s in pool_states])
-        lm_idx    = _fps_indices(torch.tensor(pool_proj, dtype=torch.float32), n_sel)
+        pool_proj = torch.tensor(
+            np.stack([state_projection_fn(s) for s in pool_states]),
+            dtype=torch.float32,
+        )
+        indices   = _spectral_indices(pool_proj, n_sel)
+        landmarks = pool_t[indices]
     else:
-        lm_idx = _fps_indices(pool_t, n_sel)
-    landmarks = pool_t[lm_idx]                   # [L, full_D] — always full-dim
+        landmarks = spectral_landmark_selection(pool_t, n_sel)
     landmark_meta = [{"task_ids": set(), "phi_norm": 0.0}] * len(landmarks)
     if verbose:
         print(f"             {len(landmarks)} landmarks selected.")
@@ -1208,10 +1419,13 @@ def build_meta_morse_complex(
     lm_np           = landmark_states.cpu().numpy()
 
     # ── Shared k-NN backward estimator (all tasks) ────────────────────────
-    knn_estimator = KNNBackwardEstimator(replay_buffer, gamma=gamma, k=knn_k)
+    knn_estimator = KNNBackwardEstimator(
+        replay_buffer, gamma=gamma, k=knn_k, survived_only=survived_only,
+    )
     if verbose:
         n_tasks_with_data = len(knn_estimator.all_task_ids())
-        print(f"  [MetaMorse] k-NN estimator built ({n_tasks_with_data} task(s) with terminal episodes).")
+        mode_str = "survived (truncated)" if survived_only else "terminated"
+        print(f"  [MetaMorse] k-NN estimator built ({n_tasks_with_data} task(s), mode={mode_str}).")
         stats = knn_estimator.back_ret_stats()
         for tid, s in stats.items():
             flag = "  ← FLAT phi, check terminal coverage" if s["std"] < 0.01 else ""
@@ -1298,9 +1512,24 @@ def build_meta_morse_complex(
     if verbose:
         print("  [MetaMorse] Step 3: computing meta-complex...")
 
+    _n_crit_total = sum(len(v) for v in task_critical.values())
+    if verbose and _n_crit_total > 0 and dbscan_eps is None:
+        # Compute eps here just for logging — meta_critical_states will recompute.
+        _crit_pos = np.array(
+            [s for crit in task_critical.values() for s in crit.values()],
+            dtype=np.float32,
+        )
+        _eps_preview = _adaptive_dbscan_eps(_crit_pos)
+        print(f"  [MetaMorse] DBSCAN eps=auto → {_eps_preview:.4f}  "
+              f"(median pairwise / 2, {_n_crit_total} critical vertices)")
+    elif verbose and dbscan_eps is not None:
+        print(f"  [MetaMorse] DBSCAN eps={dbscan_eps:.4f}  "
+              f"({_n_crit_total} critical vertices)")
+
     meta_subgoals = meta_critical_states(
         task_critical, lm_np,
         min_task_support=min_task_support,
+        eps=dbscan_eps,
     )
     if verbose:
         print(f"             {len(meta_subgoals)} meta-subgoal(s) before centrality filter.")

@@ -559,7 +559,7 @@ def main(
     if verbose:
         print("\n[Phase 1] Building Morse skeleton...")
     # Key/door/goal coordinates dominate inter-task distances; project to agent
-    # (x, y) for FPS and witness-complex distances only.
+    # (x, y) for spectral landmark selection and witness-complex distances only.
     _pos_proj = lambda s: s[:2]  # noqa: E731
 
     skeleton = phase1_build_skeleton(rb,

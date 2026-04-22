@@ -55,10 +55,15 @@ from algos.potential import (
     ShapedRewardWrapper,
     SkeletonPotential,
 )
+from algos.progress import (
+    MixedPotential,
+    ProgressPotential,
+    train_progress_estimator,
+)
 from utils.checkpoint import load_replay_buffer, save_replay_buffer
 from utils.replay_buffer import ReplayBuffer
 from utils.skeleton import build_skeleton
-from utils.viz import Phase3TrainingCallback, _P, _c, _save_fig, plot_skeleton_topology
+from utils.viz import BootstrapCallback, Phase3TrainingCallback, _P, _c, _save_fig, plot_skeleton_topology
 
 
 # ── Environment helpers ────────────────────────────────────────────────────────
@@ -89,35 +94,40 @@ def phase0_bootstrap(
     n_envs: int = 10,
     device: str = "cpu",
     verbose: bool = True,
-) -> SAC:
-    """Train SAC on the raw env and push all collected transitions to replay_buffer."""
+) -> tuple[SAC, dict]:
+    """Train SAC on the raw env and push all collected transitions to replay_buffer.
+
+    Returns (model, stats) where stats has the same shape as Phase 3 stats dicts
+    so it can be prepended to the unified all_stats list.
+    """
     if verbose:
         print(f"  [Phase 0] SAC bootstrap  env={env_id}  steps={total_steps}  n_envs={n_envs}")
 
     vec_env = make_vec_env(env_id, n_envs=n_envs)
+    cb = BootstrapCallback()
     model = SAC("MlpPolicy", vec_env, verbose=0, device=device)
-    model.learn(total_timesteps=total_steps)
-
-    # Collect a rollout under the trained policy to fill our replay buffer.
-    obs = vec_env.reset()
-    steps_per_env = max(1, total_steps // n_envs)
-    for _ in range(steps_per_env):
-        action, _ = model.predict(obs, deterministic=False)
-        obs_next, reward, done, info = vec_env.step(action)
-        for i in range(n_envs):
-            trunc_i = info[i].get("TimeLimit.truncated", False)
-            term_i  = bool(done[i]) and not trunc_i
-            replay_buffer.push(
-                obs[i], action[i], float(reward[i]),
-                obs_next[i], bool(done[i]), task_id=0,
-                terminated=term_i,
-            )
-        obs = obs_next
-
+    model.learn(total_timesteps=total_steps, callback=cb)
     vec_env.close()
+
+    # Fill our replay buffer via the single-env Gymnasium API so that the
+    # terminated/truncated distinction is captured accurately.  SB3's VecEnv
+    # merges the two flags into a single done boolean and may not reliably
+    # populate info["TimeLimit.truncated"] across all Gymnasium versions,
+    # which would silently mark every survived episode as failed.
+    collect_steps = max(5_000, total_steps // n_envs * 2)
+    _collect_transitions(model, env_id, replay_buffer, n_steps=collect_steps)
     if verbose:
-        print(f"  [Phase 0] Buffer: {len(replay_buffer)} transitions")
-    return model
+        print(f"  [Phase 0] Buffer: {len(replay_buffer)} transitions "
+              f"({collect_steps} collection steps)")
+
+    stats = {
+        "ep_rewards":     cb.ep_rewards,
+        "ep_env_rewards": cb.ep_rewards,   # no shaping in Phase 0
+        "ep_shaping":     [0.0] * len(cb.ep_rewards),
+        "ep_lengths":     cb.ep_lengths,
+        "label":          "bootstrap",
+    }
+    return model, stats
 
 
 # ── Phase 1: skeleton ──────────────────────────────────────────────────────────
@@ -131,9 +141,15 @@ def phase1_build_skeleton(
     verbose: bool = True,
     **kwargs,
 ) -> dict:
-    """Build Morse skeleton from replay buffer."""
+    """Build Morse skeleton from replay buffer using only survived trajectories."""
     if verbose:
-        print(f"  [Phase 1] Building Morse skeleton  landmarks={num_landmarks}")
+        n_eps     = len(replay_buffer._ep_ends)
+        n_survived = sum(
+            1 for ep in replay_buffer.iter_episodes()
+            if not any(np.asarray(ep.get("terminated", ep["dones"]), dtype=bool))
+        )
+        print(f"  [Phase 1] Building Morse skeleton  landmarks={num_landmarks}"
+              f"  episodes={n_eps}  survived={n_survived}")
     skeleton = build_skeleton(
         replay_buffer,
         state_dim=state_dim,
@@ -143,6 +159,7 @@ def phase1_build_skeleton(
         min_task_support=0.0,
         device=device,
         verbose=verbose,
+        survived_only=True,   # MuJoCo: use only trajectories that ran to completion
         **kwargs,
     )
     n_sub = len(skeleton.get("meta_subgoals") or skeleton.get("critical_states", {}))
@@ -159,8 +176,8 @@ def phase2_build_potential(
     replay_buffer: ReplayBuffer,
     alpha: float = 0.5,
     k: int = 10,
-    gamma: float = 0.99,
-    hit_threshold: float = 0.5,
+    gamma: float = 0.9999,
+    hit_threshold: float = 10.0,
     verbose: bool = True,
 ):
     """Build CombinedPotential from topology + empirical hitting times."""
@@ -212,6 +229,63 @@ def phase2_build_potential(
     return combined
 
 
+# ── Phase 2b: progress estimator (optional) ───────────────────────────────────
+
+def phase2b_train_progress(
+    replay_buffer: ReplayBuffer,
+    state_dim: int,
+    base_potential,
+    latent_dim: int        = 64,
+    epochs: int            = 10,
+    base_weight: float     = 0.5,
+    progress_weight: float = 0.5,
+    device: str            = "cpu",
+    verbose: bool          = True,
+):
+    """
+    Train a ProgressEstimator and blend it with base_potential.
+
+    Returns a MixedPotential when base_potential is available, a standalone
+    ProgressPotential otherwise.  Returns base_potential unchanged if training
+    produces no usable pairs.
+    """
+    if verbose:
+        print(f"  [Phase 2b] Training ProgressEstimator  "
+              f"latent_dim={latent_dim}  epochs={epochs}  "
+              f"base_w={base_weight:.2f}  prog_w={progress_weight:.2f}")
+
+    encoder, estimator = train_progress_estimator(
+        replay_buffer,
+        state_dim=state_dim,
+        latent_dim=latent_dim,
+        epochs=epochs,
+        survived_only=True,
+        device=device,
+        verbose=verbose,
+    )
+    if encoder is None:
+        if verbose:
+            print("  [Phase 2b] Progress training produced no data — "
+                  "using base potential only.")
+        return base_potential
+
+    prog_pot = ProgressPotential(encoder, estimator, state_dim, device=device)
+
+    if base_potential is not None:
+        mixed = MixedPotential(
+            base_potential, prog_pot,
+            base_weight=base_weight,
+            prog_weight=progress_weight,
+        )
+        if verbose:
+            print("  [Phase 2b] MixedPotential ready.")
+        return mixed
+
+    if verbose:
+        print("  [Phase 2b] ProgressPotential only (no base potential).")
+    return prog_pot
+
+
 # ── Phase 3: shaped SAC training ───────────────────────────────────────────────
 
 def phase3_train(
@@ -248,7 +322,9 @@ def phase3_train(
     vec_env.close()
 
     # Grow the replay buffer with new shaped-env experience.
-    _collect_transitions(model, env_id, replay_buffer, n_steps=max(1000, total_steps // 4))
+    # Budget: enough steps for at least 5-10 complete episodes.
+    # total_steps // 4 is too conservative for 1000-step MuJoCo episodes.
+    _collect_transitions(model, env_id, replay_buffer, n_steps=max(5_000, total_steps // 2))
 
     if verbose and cb.ep_rewards:
         last = cb.ep_rewards[-20:]
@@ -293,71 +369,128 @@ def _collect_transitions(
 # ── Visualisation ──────────────────────────────────────────────────────────────
 
 def _plot_training_curve(all_stats: list, save_dir: str) -> None:
-    """Save a plot of episode env returns across all iterations."""
-    x_offset = 0
-    boundaries = []
-    raw_r_segs: list = []
+    """
+    Save three separate files as a continuous curve across all phases:
+      returns_env.png        — env return (raw task reward)
+      returns_shaped.png     — shaped return (env + shaping bonus)
+      returns_shaping.png    — shaping bonus only
 
-    for it_stats in all_stats:
-        ep_env_r = it_stats.get("ep_env_rewards", [])
-        n = len(ep_env_r)
-        if n == 0:
-            continue
-        xs = list(range(x_offset, x_offset + n))
-        raw_r_segs.append((xs, ep_env_r))
-        x_offset += n
-        boundaries.append(x_offset)
+    all_stats entries may include a "label" key (e.g. "bootstrap", "iter 1").
+    The bootstrap segment is shaded distinctly; iteration boundaries are marked
+    with dashed vertical lines.
+    """
+    def _build_segs(key):
+        x_off, segs, labels, bounds = 0, [], [], []
+        for seg_stats in all_stats:
+            vals = seg_stats.get(key, [])
+            n = len(vals)
+            if n == 0:
+                continue
+            xs = list(range(x_off, x_off + n))
+            segs.append((xs, vals))
+            labels.append(seg_stats.get("label", ""))
+            x_off += n
+            bounds.append(x_off)
+        return segs, labels, bounds
 
-    if not raw_r_segs:
+    env_segs,     env_labels,  env_bounds  = _build_segs("ep_env_rewards")
+    shaped_segs,  _,           _           = _build_segs("ep_rewards")
+    shaping_segs, _,           _           = _build_segs("ep_shaping")
+
+    if not env_segs:
         return
 
-    all_xs = [x for xs, _ in raw_r_segs for x in xs]
-    all_rs = [r for _, rs in raw_r_segs for r in rs]
+    panel_cfg = [
+        (env_segs,     env_labels, env_bounds, "env return",    "Env returns (task reward)",    "returns_env.png"),
+        (shaped_segs,  env_labels, env_bounds, "shaped return", "Shaped returns (env + bonus)", "returns_shaped.png"),
+        (shaping_segs, env_labels, env_bounds, "shaping bonus", "Shaping bonus only",           "returns_shaping.png"),
+    ]
 
-    fig, ax = plt.subplots(figsize=(9, 4))
+    for segs, seg_labels, bounds, ylabel, title, fname in panel_cfg:
+        fig, ax = plt.subplots(figsize=(10, 4))
 
-    # Raw returns, coloured by iteration.
-    for i, (xs, rs) in enumerate(raw_r_segs):
-        ax.plot(xs, rs, color=_c(i), alpha=0.25, linewidth=0.8)
+        if not segs:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10)
+            ax.set_title(title)
+            fig.tight_layout()
+            _save_fig(fig, os.path.join(save_dir, fname))
+            continue
 
-    # Rolling mean (window = 5% of total episodes, min 5).
-    w = max(5, len(all_rs) // 20)
-    if len(all_rs) >= w:
-        kernel = np.ones(w) / w
-        smooth = np.convolve(all_rs, kernel, mode="valid")
-        ax.plot(
-            all_xs[w - 1:], smooth,
-            color=_P["blue"], linewidth=2.0, label=f"rolling mean (w={w})",
-        )
+        all_xs = [x for xs, _ in segs for x in xs]
+        all_vs = [v for _, vs in segs for v in vs]
 
-    # Per-iteration mean markers.
-    iter_means = [float(np.mean(rs)) for _, rs in raw_r_segs]
-    iter_mid_x = [int(np.mean(xs)) for xs, _ in raw_r_segs]
-    ax.scatter(iter_mid_x, iter_means, color=_P["gold"], s=60, zorder=5,
-               label="iter mean")
+        # Draw each phase segment; bootstrap gets grey, iterations get colours.
+        for i, (xs, vs) in enumerate(segs):
+            is_bootstrap = seg_labels[i] == "bootstrap"
+            color = "#888888" if is_bootstrap else _c(i)
+            ax.plot(xs, vs, color=color, alpha=0.18, linewidth=0.7)
 
-    # Iteration boundary lines.
-    for b in boundaries[:-1]:
-        ax.axvline(b, color=_P["red"], linewidth=0.8, linestyle="--", alpha=0.6)
+        # Continuous rolling mean over all episodes.
+        w = max(5, len(all_vs) // 20)
+        if len(all_vs) >= w:
+            smooth = np.convolve(all_vs, np.ones(w) / w, mode="valid")
+            ax.plot(all_xs[w - 1:], smooth, color=_P["blue"], linewidth=2.0,
+                    label=f"rolling mean (w={w})")
 
-    # Iteration labels along the top (axes-fraction y so they sit just inside).
-    prev = 0
-    for i, b in enumerate(boundaries):
-        mid = (prev + b) / 2
-        ax.text(mid, 0.97, f"iter {i + 1}",
-                ha="center", va="top", fontsize=7, color=_c(i),
-                transform=ax.get_xaxis_transform())
-        prev = b
+        # Per-segment mean markers.
+        seg_means = [float(np.mean(vs)) for _, vs in segs]
+        seg_mid_x = [int(np.mean(xs)) for xs, _ in segs]
+        ax.scatter(seg_mid_x, seg_means, color=_P["gold"], s=50, zorder=5,
+                   label="segment mean")
 
-    ax.set_xlabel("episode")
-    ax.set_ylabel("env return")
-    ax.set_title("Episode returns across iterations")
-    ax.legend(fontsize=8, loc="upper left")
-    fig.tight_layout()
+        # Vertical boundary lines between segments.
+        for b in bounds[:-1]:
+            ax.axvline(b, color=_P["red"], linewidth=0.8, linestyle="--", alpha=0.5)
 
-    out = os.path.join(save_dir, "returns_evolution.png")
-    _save_fig(fig, out)
-    print(f"  [Viz] {out}")
+        # Segment labels along the top.
+        iter_counter = 0
+        prev = 0
+        for i, b in enumerate(bounds):
+            lbl = seg_labels[i]
+            if not lbl:
+                iter_counter += 1
+                lbl = f"iter {iter_counter}"
+            elif lbl != "bootstrap":
+                iter_counter += 1
+            is_bootstrap = lbl == "bootstrap"
+            color = "#888888" if is_bootstrap else _c(i)
+            mid = (prev + b) / 2
+            ax.text(mid, 0.97, lbl, ha="center", va="top",
+                    fontsize=6, color=color,
+                    transform=ax.get_xaxis_transform())
+            prev = b
+
+        ax.set_xlabel("episode")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=7, loc="upper left")
+        fig.tight_layout()
+        out = os.path.join(save_dir, fname)
+        _save_fig(fig, out)
+        print(f"  [Viz] {out}")
+
+
+def _log_shaping_diagnostics(all_stats: list, iteration: int) -> None:
+    """Print per-iteration shaping diagnostics to stderr to help diagnose stagnation."""
+    if not all_stats:
+        return
+    it_stats = all_stats[-1]
+    ep_env  = it_stats.get("ep_env_rewards", [])
+    ep_sh   = it_stats.get("ep_shaping", [])
+    ep_len  = it_stats.get("ep_lengths", [])
+    if not ep_env:
+        return
+    tail = 20
+    mean_env = float(np.mean(ep_env[-tail:]))
+    mean_sh  = float(np.mean(ep_sh[-tail:])) if ep_sh else 0.0
+    mean_len = float(np.mean(ep_len[-tail:])) if ep_len else 0.0
+    sh_frac  = abs(mean_sh) / (abs(mean_env) + abs(mean_sh) + 1e-8)
+    print(f"  [Diag iter {iteration}]"
+          f"  avg_env_r={mean_env:.2f}"
+          f"  avg_shaping={mean_sh:.3f}  ({sh_frac:.1%} of |total|)"
+          f"  avg_ep_len={mean_len:.1f}"
+          f"  shaping_active={'yes' if mean_sh != 0.0 else 'NO — potential is None'}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -368,26 +501,38 @@ def main():
     )
     parser.add_argument("--env",            default="Hopper-v4",
                         help="Gymnasium env ID (default: Hopper-v4)")
-    parser.add_argument("--iterations",     type=int, default=4,
+    parser.add_argument("--iterations",     type=int, default=5,
                         help="Number of shape→train cycles (default: 4)")
     parser.add_argument("--phase0-steps",   type=int, default=20_000,
                         help="Bootstrap SAC timesteps (default: 20000)")
-    parser.add_argument("--phase3-steps",   type=int, default=20_000,
+    parser.add_argument("--phase3-steps",   type=int, default=10_000,
                         help="SAC timesteps per shaped iteration (default: 20000)")
     parser.add_argument("--landmarks",      type=int, default=200,
                         help="FPS landmark count (default: 32)")
-    parser.add_argument("--alpha",          type=float, default=0.0,
+    parser.add_argument("--alpha",          type=float, default=0.5,
                         help="Potential mix: 1=pure topology, 0=pure empirical (default: 0.5)")
     parser.add_argument("--shaping-scale",  type=float, default=1.0,
                         help="Intrinsic reward coefficient (default: 1.0)")
-    parser.add_argument("--gamma",          type=float, default=0.95,
-                        help="Discount factor (default: 0.99)")
+    parser.add_argument("--gamma",          type=float, default=0.999,
+                        help="Discount factor (default: 0.95)")
     parser.add_argument("--refine-every",   type=int, default=1,
                         help="Rebuild skeleton every N iterations (default: 1=every)")
     parser.add_argument("--save-dir",       default="results/mujoco_single",
                         help="Output directory (default: results/mujoco_single)")
     parser.add_argument("--device",         default="cpu")
     parser.add_argument("--no-verbose",     action="store_true")
+    parser.add_argument("--dbscan-eps",     type=float, default=None,
+                        help="DBSCAN eps for meta-subgoal clustering. "
+                             "Default: auto (median pairwise distance / 2).")
+    # Progress-estimation shaping
+    parser.add_argument("--use-progress",        action="store_true",
+                        help="Add learned progress-estimation reward shaping")
+    parser.add_argument("--progress-latent-dim", type=int,   default=64,
+                        help="Encoder latent dim for progress estimator (default: 64)")
+    parser.add_argument("--progress-epochs",     type=int,   default=10,
+                        help="Training epochs for progress estimator (default: 10)")
+    parser.add_argument("--progress-weight",     type=float, default=0.5,
+                        help="Fraction of shaping from progress vs base (default: 0.5)")
     args = parser.parse_args()
 
     verbose = not args.no_verbose
@@ -406,29 +551,39 @@ def main():
     rb_path = os.path.join(args.save_dir, "replay_buffer.npz")
     model_path = os.path.join(args.save_dir, "phase0_model.zip")
 
+    # all_stats holds one dict per training segment (bootstrap + per-iteration
+    # phase 3).  Each dict has ep_rewards / ep_env_rewards / ep_shaping /
+    # ep_lengths / label.  Passed to _plot_training_curve for the continuous plot.
+    all_stats: list = []
+
     if os.path.exists(rb_path) and os.path.exists(model_path):
         if verbose:
             print("\n[Phase 0] Loading existing bootstrap data...")
         rb = load_replay_buffer(rb_path, device=args.device)
         model = SAC.load(model_path, device=args.device)
-        # Rebuilt rollout buffer is not needed (SAC uses its own off-policy buffer).
         if verbose:
             print(f"  Loaded {len(rb)} transitions.")
+        # No bootstrap curve available when loading from checkpoint.
+        all_stats.append({
+            "ep_rewards": [], "ep_env_rewards": [],
+            "ep_shaping": [], "ep_lengths": [],
+            "label": "bootstrap (loaded)",
+        })
     else:
         if verbose:
             print("\n[Phase 0] SAC bootstrap...")
         rb = ReplayBuffer(device=args.device)
-        model = phase0_bootstrap(
+        model, p0_stats = phase0_bootstrap(
             args.env, rb,
             total_steps=args.phase0_steps,
             device=args.device,
             verbose=verbose,
         )
+        all_stats.append(p0_stats)
         save_replay_buffer(rb, rb_path)
         model.save(model_path)
 
     metrics = {"iterations": [], "eval_returns": []}
-    all_phase3_stats: list = []
     skeleton = None
 
     for iteration in range(args.iterations):
@@ -448,6 +603,7 @@ def main():
                     rb, state_dim, action_dim,
                     num_landmarks=args.landmarks,
                     gamma=args.gamma,
+                    dbscan_eps=args.dbscan_eps,
                     device=args.device,
                     verbose=verbose,
                 )
@@ -483,6 +639,20 @@ def main():
                 print("\n[Phase 2] No subgoals found — training without shaping.")
             potential = None
 
+        # ── Phase 2b: progress estimator (optional) ───────────────────────
+        if args.use_progress:
+            if verbose:
+                print("\n[Phase 2b] Training progress estimator...")
+            potential = phase2b_train_progress(
+                rb, state_dim, potential,
+                latent_dim=args.progress_latent_dim,
+                epochs=args.progress_epochs,
+                base_weight=1.0 - args.progress_weight,
+                progress_weight=args.progress_weight,
+                device=args.device,
+                verbose=verbose,
+            )
+
         # ── Phase 3: shaped SAC ────────────────────────────────────────────
         if verbose:
             print("\n[Phase 3] Continuing SAC with shaped rewards...")
@@ -496,7 +666,9 @@ def main():
             device=args.device,
             verbose=verbose,
         )
-        all_phase3_stats.append(p3_stats)
+        p3_stats["label"] = f"iter {iteration + 1}"
+        all_stats.append(p3_stats)
+        _log_shaping_diagnostics(all_stats, iteration + 1)
 
         # ── Evaluate ──────────────────────────────────────────────────────
         eval_return = _evaluate(model, args.env, n_episodes=10)
@@ -511,7 +683,7 @@ def main():
         ckpt_rb = os.path.join(args.save_dir, "replay_buffer.npz")
         save_replay_buffer(rb, ckpt_rb)
 
-        _plot_training_curve(all_phase3_stats, args.save_dir)
+        _plot_training_curve(all_stats, args.save_dir)
 
     # ── Final outputs ─────────────────────────────────────────────────────────
     metrics_path = os.path.join(args.save_dir, "metrics.json")

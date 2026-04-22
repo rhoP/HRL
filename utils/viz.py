@@ -235,11 +235,11 @@ def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
                        linewidth=0.9, alpha=0.7)
 
         # Iteration labels just above the x-axis at each boundary
-        ylim = ax.get_ylim()
-        y_label = ylim[0] + (ylim[1] - ylim[0]) * 0.04
-        for i, b in enumerate(iter_boundaries):
-            ax.text(b + n_epochs * 0.005, y_label, f"iter {i + 1}→",
-                    fontsize=6, color=_P["mid"], va="bottom")
+        #ylim = ax.get_ylim()
+        #y_label = ylim[0] + (ylim[1] - ylim[0]) * 0.04
+        #for i, b in enumerate(iter_boundaries):
+        #    ax.text(b + n_epochs * 0.005, y_label, 
+        #            fontsize=6, color=_P["mid"], va="bottom")
 
         ax.set_title(labels[key], fontsize=10)
         ax.set_xlabel("epoch", fontsize=8)
@@ -299,7 +299,7 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer, save_path: str) -
         all_2d[:, 1],
         s=3,
         c=_P["light"],
-        alpha=0.3,
+        alpha=0.5,
         zorder=1,
         label="states",
     )
@@ -730,7 +730,33 @@ def run_demos(
     return results
 
 
-# ── Phase 3 callback & visualisation ──────────────────────────────────────
+# ── Callbacks ─────────────────────────────────────────────────────────────
+
+
+class BootstrapCallback(_SB3BaseCallback):
+    """
+    SB3 callback for Phase 0 bootstrap training.
+
+    Captures raw episode returns and lengths from SB3's Monitor wrapper
+    (info["episode"]["r"] / info["episode"]["l"]) which are populated for
+    every env in a VecEnv at episode end.
+    """
+
+    def __init__(self):
+        super().__init__(verbose=0)
+        self.ep_rewards: list = []
+        self.ep_lengths: list = []
+
+    def _on_step(self) -> bool:
+        for done, info in zip(
+            self.locals.get("dones", []), self.locals.get("infos", [])
+        ):
+            if done:
+                ep = info.get("episode", {})
+                if ep:
+                    self.ep_rewards.append(float(ep.get("r", 0.0)))
+                    self.ep_lengths.append(int(ep.get("l", 0)))
+        return True
 
 
 class Phase3TrainingCallback(_SB3BaseCallback):

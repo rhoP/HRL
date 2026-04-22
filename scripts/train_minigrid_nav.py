@@ -521,8 +521,8 @@ def main(
     if verbose:
         print("\n[Phase 1] Building Morse skeleton...")
     # Goal coordinates (s[3:5]) dominate inter-task distances, splitting the
-    # complex into disconnected manifolds.  Use only agent (x, y) for FPS and
-    # witness-complex distances; full state is still used for KNN phi estimates.
+    # complex into disconnected manifolds.  Use only agent (x, y) for spectral
+    # landmark selection and witness-complex distances; full state is used for KNN phi estimates.
     _pos_proj = lambda s: s[:2]  # noqa: E731
 
     skeleton = phase1_build_skeleton(rb,

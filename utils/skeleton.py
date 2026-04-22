@@ -38,6 +38,8 @@ def build_skeleton(
     state_projection_fn          = None,
     device: str                  = "cpu",
     verbose: bool                = True,
+    survived_only: bool          = False,
+    dbscan_eps: float            = None,
 ) -> dict:
     """
     Build the Meta-Morse skeleton from experience stored in `replay_buffer`.
@@ -78,6 +80,8 @@ def build_skeleton(
         state_projection_fn=state_projection_fn,
         device=device,
         verbose=verbose,
+        survived_only=survived_only,
+        dbscan_eps=dbscan_eps,
     )
 
 

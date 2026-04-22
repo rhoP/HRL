@@ -265,55 +265,108 @@ class KNNBackwardEstimator:
     """
     Non-parametric potential estimated directly from replay-buffer trajectories.
 
-    Φ(s; task) = mean backward-discounted return of the k *visited states*
-                 nearest to s, restricted to episodes that reached a terminal
-                 state (done=True).
+    Φ(s; task) = (importance-weighted) mean backward-discounted return of the k
+                 *visited states* nearest to s.
 
-    Every step t of every terminal episode contributes one entry
-    {"state": states[t], "back_ret": Σ_{i=t}^{hit} γ^{i-t} r_i}.
-    This gives a phi landscape that varies across the state space even when
-    all episodes start from the same initial state.
+    Episode selection
+    -----------------
+    survived_only=False (default)
+        Use episodes that ended with a natural terminal (terminated=True).
+        Suitable for environments where goal-reaching ends the episode.
+    survived_only=True   ← MuJoCo locomotion mode
+        Use episodes that survived to the time limit (no terminated=True step),
+        because in MuJoCo terminated=True means failure (falling), not success.
+        Importance-sampling fallback: when fewer than `min_survived` such
+        episodes exist, all episodes are included but each step is weighted by
+          w(τ) = max(0, R(τ)) / R_max
+        so high-return (near-successful) episodes dominate.
 
     Parameters
     ----------
-    replay_source : object with iter_episodes()
-        Each episode dict must contain keys:
-          "states"  : np.ndarray [T+1, D]
-          "rewards" : np.ndarray [T]
-          "dones"   : np.ndarray [T, bool]
-          "task_id" : int  (optional, defaults to 0)
-    gamma   : discount factor
-    k       : number of nearest neighbours
+    replay_source   : object with iter_episodes()
+    gamma           : discount factor
+    k               : number of nearest neighbours
+    survived_only   : use truncated (survived) episodes instead of terminated ones
+    min_survived    : minimum survived episodes before IS fallback kicks in
     """
 
-    def __init__(self, replay_source, gamma: float = 0.99, k: int = 10):
+    def __init__(
+        self,
+        replay_source,
+        gamma: float        = 0.99,
+        k: int              = 10,
+        survived_only: bool = False,
+        min_survived: int   = 3,
+    ):
         self.gamma = gamma
         self.k     = k
-        # {task_id: [{"state": np.ndarray [D], "back_ret": float}]}
         self._data: dict = {}
 
+        # ── First pass: collect all episodes with metadata ─────────────────
+        all_eps = []
         for ep in replay_source.iter_episodes():
             states     = np.asarray(ep["states"],  dtype=np.float32)
             rewards    = np.asarray(ep["rewards"], dtype=np.float32)
-            # Use `terminated` if present; fall back to `dones` for old buffers.
-            term_flags = np.asarray(ep.get("terminated", ep["dones"]), dtype=bool)
+            assert "terminated" in ep, (
+                "Episode dict is missing 'terminated' key — check that all "
+                "replay_buffer.push() calls pass terminated= explicitly."
+            )
+            term_flags = np.asarray(ep["terminated"], dtype=bool)
             tid        = int(ep.get("task_id", 0))
             T          = len(rewards)
+            survived   = not any(term_flags)   # no early termination = survived
+            total_R    = float(np.dot(rewards,
+                               gamma ** np.arange(T - 1, -1, -1, dtype=np.float32)))
+            all_eps.append({
+                "states": states, "rewards": rewards, "term_flags": term_flags,
+                "tid": tid, "T": T, "survived": survived, "total_R": total_R,
+            })
 
-            # Only use episodes that ended with a natural terminal (goal reached).
-            # Timeout truncations have near-zero backward returns and pollute phi.
-            hit = None
-            for t in range(T):
-                if term_flags[t]:
-                    hit = t
-                    break
-            if hit is None:
+        # ── Select which episodes to use and compute IS weights ────────────
+        use_is_weights = False
+        if survived_only:
+            survived_eps = [e for e in all_eps if e["survived"]]
+            if len(survived_eps) >= min_survived:
+                selected = survived_eps
+            else:
+                # IS fallback: include all but weight by return
+                selected       = all_eps
+                use_is_weights = True
+        else:
+            # Original behaviour: use episodes with at least one terminated step
+            selected = [e for e in all_eps if any(e["term_flags"])]
+
+        if use_is_weights:
+            max_R = max((e["total_R"] for e in selected), default=1e-8)
+            max_R = max(max_R, 1e-8)
+            for e in selected:
+                e["_w"] = float(max(0.0, e["total_R"]) / max_R)
+        else:
+            for e in selected:
+                e["_w"] = 1.0
+
+        # ── Second pass: build backward-return entries ─────────────────────
+        for ep_data in selected:
+            w  = ep_data["_w"]
+            if w == 0.0:
                 continue
+            states     = ep_data["states"]
+            rewards    = ep_data["rewards"]
+            term_flags = ep_data["term_flags"]
+            tid        = ep_data["tid"]
+            T          = ep_data["T"]
 
-            n = hit + 1   # steps that count toward the return
+            if survived_only:
+                # Use all T steps of the episode (survived or IS-weighted)
+                n = T
+            else:
+                # Original: steps up to (and including) the first terminal
+                hit = next((t for t in range(T) if term_flags[t]), None)
+                if hit is None:
+                    continue
+                n = hit + 1
 
-            # Backward returns for every visited step in O(n).
-            # back_ret[t] = Σ_{i=t}^{hit} γ^{i-t} r_i
+            # back_ret[t] = Σ_{i=t}^{n-1} γ^{i-t} r_i
             back_rets = np.empty(n, dtype=np.float32)
             G = 0.0
             for t in range(n - 1, -1, -1):
@@ -325,27 +378,33 @@ class KNNBackwardEstimator:
                 task_list.append({
                     "state":    states[t].copy(),
                     "back_ret": float(back_rets[t]),
+                    "weight":   w,
                 })
 
-        # Build one KDTree per task_id (O(N log N) once, O(log N) per query).
+        # ── Build one KDTree per task_id ───────────────────────────────────
         self._trees:     dict = {}
         self._back_rets: dict = {}
+        self._weights:   dict = {}
         for tid, entries in self._data.items():
             pts = np.stack([e["state"] for e in entries])
             self._trees[tid]     = KDTree(pts)
-            self._back_rets[tid] = np.array(
-                [e["back_ret"] for e in entries], dtype=np.float32
-            )
+            self._back_rets[tid] = np.array([e["back_ret"] for e in entries], dtype=np.float32)
+            self._weights[tid]   = np.array([e["weight"]   for e in entries], dtype=np.float32)
 
     def phi(self, s: np.ndarray, task_id: int = 0) -> float:
-        """Φ(s; task) — k-NN mean backward-discounted return from visited states."""
+        """Φ(s; task) — importance-weighted k-NN mean backward-discounted return."""
         tree = self._trees.get(task_id)
         if tree is None:
             return 0.0
-        s_flat = _to_numpy_f32(s).flatten()
-        k      = min(self.k, len(self._back_rets[task_id]))
+        s_flat    = _to_numpy_f32(s).flatten()
+        k         = min(self.k, len(self._back_rets[task_id]))
         _, nn_idx = tree.query(s_flat, k=k)
-        return float(np.mean(self._back_rets[task_id][nn_idx]))
+        w         = self._weights[task_id][nn_idx]
+        br        = self._back_rets[task_id][nn_idx]
+        w_sum     = float(w.sum())
+        if w_sum < 1e-8:
+            return float(np.mean(br))
+        return float(np.dot(w, br) / w_sum)
 
     def back_ret_stats(self) -> dict:
         """Return per-task diagnostics: n, mean, std of back_ret values.
@@ -359,9 +418,12 @@ class KNNBackwardEstimator:
         stats = {}
         for tid, entries in self._data.items():
             vals = np.array([e["back_ret"] for e in entries], dtype=np.float32)
+            wts  = np.array([e.get("weight", 1.0) for e in entries], dtype=np.float32)
+            w_sum = float(wts.sum())
+            w_mean = float(np.dot(wts, vals) / w_sum) if w_sum > 1e-8 else float(vals.mean())
             stats[tid] = {
                 "n":    len(vals),
-                "mean": float(vals.mean()),
+                "mean": w_mean,
                 "std":  float(vals.std()),
             }
         return stats
