@@ -10,7 +10,9 @@ Phases:
   5. Repeat.
 
 Entry point:
-    python3 algos/MetaPolicy.py --tasks reach-v3 push-v3 \\
+    python3 algos/MetaPolicy.py --n-mt10-tasks 5 \\
+        --iterations 3 --landmarks 32 --meta-epochs 500 --save-dir results/run1
+    python3 algos/MetaPolicy.py --mt10-envs reach-v3 push-v3 pick-place-v3 door-open-v3 drawer-close-v3 \\
         --iterations 3 --landmarks 32 --meta-epochs 500 --save-dir results/run1
 """
 
@@ -33,6 +35,7 @@ from stable_baselines3.common.env_util import make_vec_env
 
 from models.meta_policy_net import MetaPolicy, MetaValueNetwork
 from algos.potential import (
+    AlphaScheduler,
     SkeletonPotential,
     EmpiricalHittingTimePotential,
     CombinedPotential,
@@ -41,6 +44,7 @@ from algos.potential import (
 from algos.meta_policy_gradient import (
     meta_policy_gradient_with_skeleton_shaping,
     evaluate_meta_policy,
+    evaluate_meta_policy_per_task,
 )
 from utils.replay_buffer import ReplayBuffer
 from utils.skeleton import build_skeleton, refine_skeleton
@@ -118,13 +122,46 @@ class MetaWorldTaskDistribution:
         return self.tasks[np.random.randint(len(self.tasks))]
 
     @classmethod
-    def from_env_names(cls, env_names: list, max_tasks_per_env: int = 5):
+    def from_mt10(cls, subset_envs=None, subset_size: int = 5, tasks_per_env: int = 1):
+        """Build from MT10, using genuinely distinct task types (one env = one task type).
+
+        Args:
+            subset_envs: explicit list of MT10 env names to use; if None, picks
+                         the first `subset_size` envs in MT10 benchmark order.
+            subset_size: how many env types to include when subset_envs is None.
+            tasks_per_env: task instances (random initializations) per env type.
+        """
+        mt10 = metaworld.MT10()
+        all_env_names = list(mt10.train_classes.keys())
+
+        if subset_envs is not None:
+            # Guard against passing a number by mistake (e.g. --mt10-envs 5).
+            numeric = [e for e in subset_envs if str(e).isdigit()]
+            if numeric:
+                raise ValueError(
+                    f"--mt10-envs received numeric value(s) {numeric}. "
+                    f"To pick N tasks by count use --n-mt10-tasks {numeric[0]} instead. "
+                    f"Available env names: {all_env_names}"
+                )
+            env_names = [e for e in subset_envs if e in mt10.train_classes]
+            unknown = [e for e in subset_envs if e not in mt10.train_classes]
+            if unknown:
+                raise ValueError(
+                    f"Unknown MT10 env name(s): {unknown}\n"
+                    f"Available: {all_env_names}"
+                )
+        else:
+            env_names = all_env_names[:subset_size]
+
+        env_to_tasks: dict = {}
+        for mw_task in mt10.train_tasks:
+            env_to_tasks.setdefault(mw_task.env_name, []).append(mw_task)
+
         tasks = []
         task_id = 0
         for env_name in env_names:
-            ml1 = metaworld.ML1(env_name)
-            env_cls = ml1.train_classes[env_name]
-            for mw_task in ml1.train_tasks[:max_tasks_per_env]:
+            env_cls = mt10.train_classes[env_name]
+            for mw_task in env_to_tasks.get(env_name, [])[:tasks_per_env]:
                 tasks.append(MetaWorldTask(task_id, env_cls, mw_task))
                 task_id += 1
         return cls(tasks)
@@ -205,7 +242,9 @@ def _get_scripted_policy(env_name: str):
     except ImportError:
         return None
     # "reach-v3" → ["reach", "v3"] → "ReachV3" → "SawyerReachV3Policy"
-    cls_name = "Sawyer" + "".join(p.capitalize() for p in env_name.split("-")) + "Policy"
+    cls_name = (
+        "Sawyer" + "".join(p.capitalize() for p in env_name.split("-")) + "Policy"
+    )
     cls = getattr(_mwp, cls_name, None)
     if cls is None:
         return None
@@ -220,15 +259,23 @@ def _collect_scripted_episodes(
     replay_buffer: ReplayBuffer,
     n_episodes: int = 10,
     max_steps: int = 500,
+    near_success_threshold: float = 0.95,
+    max_attempts_multiplier: int = 5,
     verbose: bool = True,
 ) -> int:
-    """Roll out MetaWorld's scripted (expert) policy for task and push every
-    transition into replay_buffer.  Returns the number of successful episodes.
+    """Roll out MetaWorld's scripted policy, targeting n_episodes pushed episodes.
 
-    Scripted episodes guarantee coverage of the success region for each task.
-    This is critical for tasks like push-v3 where a cold-start SAC policy
-    almost never reaches the goal, leaving the empirical potential empty and
-    the DBSCAN subgoal clustering biased toward easier tasks.
+    Strategy:
+      1. Run up to n_episodes × max_attempts_multiplier attempts, stopping early
+         once n_episodes successes are collected.
+      2. Push all successful episodes immediately.
+      3. If successes < n_episodes, fill the remainder from the buffered
+         non-successful attempts whose total reward ≥ near_success_threshold ×
+         max_reward_seen, taken in descending reward order.  These near-successful
+         episodes provide coverage of the approach trajectory even when the policy
+         fails to complete the task consistently.
+
+    Returns the total number of episodes pushed (successful + near-successful).
     """
     policy = _get_scripted_policy(task.env_name)
     if policy is None:
@@ -236,14 +283,27 @@ def _collect_scripted_episodes(
             print(f"    [scripted] No scripted policy for {task.env_name}, skipping.")
         return 0
 
-    n_success = 0
-    for _ in range(n_episodes):
+    max_attempts = n_episodes * max_attempts_multiplier
+
+    # Buffer every non-successful episode so we can select the best ones later.
+    # Each entry: ([transition, ...], total_reward)
+    # Transition: (obs_arr, action_arr, reward, obs_next_arr, done, terminated)
+    successful_eps   = []   # [(transitions, total_reward), ...]
+    near_success_eps = []   # [(transitions, total_reward), ...]
+    max_reward_seen  = -float("inf")
+
+    for _ in range(max_attempts):
+        if len(successful_eps) >= n_episodes:
+            break
+
         env = task.create_env()
         result = env.reset()
         obs = result[0] if isinstance(result, tuple) else result
         done = False
         t = 0
         ep_success = False
+        ep_reward  = 0.0
+        transitions = []
 
         while not done and t < max_steps:
             obs_arr = np.asarray(obs, dtype=np.float32).flatten()
@@ -254,29 +314,61 @@ def _collect_scripted_episodes(
             action_arr = np.asarray(action, dtype=np.float32).flatten()
             obs_next, reward, terminated, truncated, info = env.step(action_arr)
             done = terminated or truncated
-            replay_buffer.push(
+            transitions.append((
                 obs_arr,
                 action_arr,
                 float(reward),
                 np.asarray(obs_next, dtype=np.float32).flatten(),
                 done,
-                task.id,
-                terminated=bool(terminated),
-            )
+                bool(terminated),
+            ))
+            ep_reward += float(reward)
             if info.get("success", False):
                 ep_success = True
             obs = obs_next
             t += 1
         env.close()
-        if ep_success:
-            n_success += 1
 
+        max_reward_seen = max(max_reward_seen, ep_reward)
+        if ep_success:
+            successful_eps.append((transitions, ep_reward))
+        else:
+            near_success_eps.append((transitions, ep_reward))
+
+    def _push_ep(transitions: list) -> None:
+        for obs_arr, action_arr, reward, obs_next_arr, done, terminated in transitions:
+            replay_buffer.push(
+                obs_arr, action_arr, reward, obs_next_arr,
+                done, task.id, terminated=terminated,
+            )
+
+    # Push successful episodes first
+    for ep_transitions, _ in successful_eps:
+        _push_ep(ep_transitions)
+
+    # Fill remaining slots with near-successful fallbacks
+    n_fallback = 0
+    if len(successful_eps) < n_episodes and near_success_eps:
+        # Threshold relative to the best total reward seen across all attempts
+        reward_threshold = near_success_threshold * max_reward_seen
+        candidates = sorted(near_success_eps, key=lambda x: x[1], reverse=True)
+        for ep_transitions, ep_reward in candidates:
+            if len(successful_eps) + n_fallback >= n_episodes:
+                break
+            if ep_reward >= reward_threshold:
+                _push_ep(ep_transitions)
+                n_fallback += 1
+
+    n_pushed = len(successful_eps) + n_fallback
     if verbose:
+        attempts_run = len(successful_eps) + len(near_success_eps)
         print(
             f"    [scripted] {task.env_name} (task {task.id}): "
-            f"{n_success}/{n_episodes} successful episodes"
+            f"{len(successful_eps)} successful + {n_fallback} near-successful "
+            f"= {n_pushed}/{n_episodes} pushed  "
+            f"({attempts_run} attempts, max_reward={max_reward_seen:.2f})"
         )
-    return n_success
+    return n_pushed
 
 
 def phase0_collect_initial_data(
@@ -344,7 +436,8 @@ def phase0_collect_initial_data(
         # the buffer even when the SB3 policy hasn't solved the task yet.
         if scripted_episodes > 0:
             _collect_scripted_episodes(
-                task, replay_buffer,
+                task,
+                replay_buffer,
                 n_episodes=scripted_episodes,
                 verbose=verbose,
             )
@@ -425,7 +518,9 @@ def phase2_build_potential(
         or "_skel_potential_cached" not in skeleton_data
     ):
         skel_pot = SkeletonPotential(
-            lm_np, skeleton_data["simplices"], meta_subgoals,
+            lm_np,
+            skeleton_data["simplices"],
+            meta_subgoals,
             state_projection_fn=state_projection_fn,
         )
         skeleton_data["_skel_potential_cached"] = skel_pot
@@ -464,7 +559,7 @@ def phase2_build_potential(
             covered = [f"task {t}:{counts[t]}" for t in all_task_ids if t in counts]
             unsupported = [f"task {t}" for t in all_task_ids if t not in counts]
             covered_str = ", ".join(covered) if covered else "none"
-            unsp_str    = ", ".join(unsupported) if unsupported else "none"
+            unsp_str = ", ".join(unsupported) if unsupported else "none"
             warn = "  ← WILL SUPPRESS SHAPING" if unsupported else ""
             print(
                 f"    {sg_id}: supported by [{covered_str}]  "
@@ -517,13 +612,18 @@ def phase3_train_task_policies(
                 f"  [Phase 3] Training policy for {task.env_name} (task {task.id})..."
             )
 
-        def _make_env(t=task, pot=potential, scale=shaping_scale,
-                      proj=state_projection_fn):
+        def _make_env(
+            t=task, pot=potential, scale=shaping_scale, proj=state_projection_fn
+        ):
             env = MetaWorldGymWrapper(t)
             if pot is not None:
-                env = ShapedRewardWrapper(env, pot, shaping_scale=scale,
-                                          state_projection_fn=proj,
-                                          task_id=t.id)
+                env = ShapedRewardWrapper(
+                    env,
+                    pot,
+                    shaping_scale=scale,
+                    state_projection_fn=proj,
+                    task_id=t.id,
+                )
             return env
 
         cb = Phase3TrainingCallback()
@@ -640,7 +740,10 @@ def main_meta_rl_loop(
     shaping_scale: float = 1.0,
     subgoal_threshold: float = float("inf"),
     potential_alpha: float = 0.5,
+    alpha_anneal_iters: int = 3,
     state_projection_fn=None,
+    dbscan_eps: float = None,
+    max_pool_size: int = None,
     algo: str = "SAC",
     eval_episodes: int = 10,
     n_demos: int = 5,
@@ -656,6 +759,10 @@ def main_meta_rl_loop(
     os.makedirs(save_dir, exist_ok=True)
     discrete = False  # MetaWorld is continuous
 
+    _alpha_sched = AlphaScheduler(
+        alpha_start=potential_alpha, alpha_end=0.0, anneal_iters=alpha_anneal_iters
+    )
+
     if verbose:
         print("=" * 60)
         print("Meta-RL pipeline  (MetaWorld)")
@@ -664,6 +771,7 @@ def main_meta_rl_loop(
             f"landmarks: {num_landmarks}, iterations: {num_iterations}"
         )
         print(f"  potential_alpha: {potential_alpha}  shaping_scale: {shaping_scale}")
+        print(f"  alpha schedule: {_alpha_sched}")
         print(f"  save_dir: {save_dir}")
         print("=" * 60)
 
@@ -672,7 +780,9 @@ def main_meta_rl_loop(
         "phase3_success_rates": [],
         "phase4_losses": [],
         "eval_success_rates": [],
+        "per_task_success_rates": [],  # list of {task_id: sr} per iteration
     }
+    graduated_task_ids: set = set()  # tasks dropped after hitting 100% success
 
     tracker = BestModelTracker(save_dir, higher_is_better=True)
 
@@ -710,6 +820,8 @@ def main_meta_rl_loop(
         action_dim=action_dim,
         num_landmarks=num_landmarks,
         state_projection_fn=state_projection_fn,
+        dbscan_eps=dbscan_eps,
+        max_pool_size=max_pool_size,
         min_task_support=0.4,
         device=device,
         verbose=verbose,
@@ -739,12 +851,13 @@ def main_meta_rl_loop(
             print(f"{'─' * 60}")
 
         # Phase 2 — combined potential (skeleton + empirical, normalised)
+        current_alpha = _alpha_sched.alpha(iteration)
         if verbose:
-            print(f"[Phase 2] Building combined potential (α={potential_alpha:.2f})...")
+            print(f"[Phase 2] Building combined potential (α={current_alpha:.3f}, iter {iteration})...")
         potential = phase2_build_potential(
             skeleton,
             rb,
-            alpha=potential_alpha,
+            alpha=current_alpha,
             gamma=gamma,
             verbose=verbose,
             state_projection_fn=state_projection_fn,
@@ -816,6 +929,43 @@ def main_meta_rl_loop(
         if verbose:
             print(f"  success_rate={sr:.1%}")
 
+        # Per-task evaluation — graduate tasks that hit 100% success
+        per_task_sr = evaluate_meta_policy_per_task(
+            meta_policy,
+            task_distribution,
+            n_episodes=eval_episodes,
+            device=device,
+        )
+        metrics["per_task_success_rates"].append(per_task_sr)
+
+        newly_graduated = [
+            t for t in task_distribution.tasks
+            if per_task_sr.get(t.id, 0.0) >= 1.0 and t.id not in graduated_task_ids
+        ]
+        if newly_graduated:
+            new_ids = {t.id for t in newly_graduated}
+            for t in newly_graduated:
+                graduated_task_ids.add(t.id)
+                if verbose:
+                    print(f"  ✓ Task {t.env_name} (id={t.id}) reached 100% — dropped from future iterations")
+            task_distribution.tasks = [
+                t for t in task_distribution.tasks if t.id not in graduated_task_ids
+            ]
+            removed = rb.remove_tasks(new_ids)
+            save_replay_buffer(rb, rb_path)
+            if verbose:
+                remaining = [t.env_name for t in task_distribution.tasks]
+                print(f"  Removed {removed} transitions for graduated task(s) from buffer.")
+                print(f"  Remaining tasks ({len(remaining)}): {remaining}")
+        elif verbose:
+            for t in task_distribution.tasks:
+                print(f"  {t.env_name}: {per_task_sr.get(t.id, 0.0):.1%}")
+
+        if not task_distribution.tasks:
+            if verbose:
+                print("  All tasks graduated — stopping early.")
+            break
+
         # Checkpoint
         ckpt_dir = save_checkpoint(
             save_dir,
@@ -863,6 +1013,8 @@ def main_meta_rl_loop(
                 rb,
                 num_landmarks=num_landmarks,
                 state_projection_fn=state_projection_fn,
+                dbscan_eps=dbscan_eps,
+                max_pool_size=max_pool_size,
                 min_task_support=0.4,
                 device=device,
                 verbose=verbose,
@@ -913,14 +1065,33 @@ def main_meta_rl_loop(
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
-_DEFAULT_TASKS = ["reach-v3", "push-v3", "pick-place-v3"]
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Meta-RL on MetaWorld")
-    parser.add_argument("--tasks", nargs="+", default=_DEFAULT_TASKS, metavar="ENV")
-    parser.add_argument("--max-tasks", type=int, default=3)
+    parser = argparse.ArgumentParser(description="Meta-RL on MetaWorld (MT10 subset)")
+    parser.add_argument(
+        "--mt10-envs",
+        nargs="+",
+        default=None,
+        metavar="ENV",
+        help=(
+            "explicit MT10 env names to use, e.g.: "
+            "--mt10-envs reach-v3 push-v3 pick-place-v3 door-open-v3 drawer-close-v3 "
+            "(v3 names; omit to auto-pick --n-mt10-tasks envs from MT10 in benchmark order)"
+        ),
+    )
+    parser.add_argument(
+        "--n-mt10-tasks",
+        type=int,
+        default=5,
+        help="number of MT10 env types to use when --mt10-envs is not specified (default: 5)",
+    )
+    parser.add_argument(
+        "--tasks-per-env",
+        type=int,
+        default=1,
+        help="task instances (random initialisations) per MT10 env type (default: 1)",
+    )
     parser.add_argument("--iterations", type=int, default=5)
-    parser.add_argument("--landmarks", type=int, default=200)
+    parser.add_argument("--landmarks", type=int, default=500)
     parser.add_argument("--meta-epochs", type=int, default=500)
     parser.add_argument("--task-steps", type=int, default=10_000)
     parser.add_argument("--timesteps", type=int, default=50_000)
@@ -946,7 +1117,31 @@ if __name__ == "__main__":
         type=int,
         default=10,
         help="expert scripted-policy episodes per task added to the Phase 0 buffer "
-             "(default: 10; set 0 to disable)",
+        "(default: 10; set 0 to disable)",
+    )
+    parser.add_argument(
+        "--alpha-anneal-iters",
+        type=int,
+        default=3,
+        help="iterations over which to anneal potential_alpha from its start value to 0 (default: 3)",
+    )
+    parser.add_argument(
+        "--dbscan-eps",
+        type=float,
+        default=None,
+        help="DBSCAN neighbourhood radius for meta-subgoal clustering (default: auto)",
+    )
+    parser.add_argument(
+        "--max-pool-size",
+        type=int,
+        default=None,
+        help="max states passed from stratified sampling to FPS landmark selection "
+             "(default: num_landmarks * 20)",
+    )
+    parser.add_argument(
+        "--no-projection",
+        action="store_true",
+        help="disable the MetaWorld task-agnostic end-effector state projection",
     )
     parser.add_argument("--save-dir", default="results/meta_rl")
     parser.add_argument("--load", default=None, metavar="CKPT_DIR")
@@ -955,10 +1150,16 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
-    dist = MetaWorldTaskDistribution.from_env_names(
-        args.tasks, max_tasks_per_env=args.max_tasks
+    dist = MetaWorldTaskDistribution.from_mt10(
+        subset_envs=args.mt10_envs or None,
+        subset_size=args.n_mt10_tasks,
+        tasks_per_env=args.tasks_per_env,
     )
-    print(f"Task distribution: {len(dist.tasks)} tasks  ({', '.join(args.tasks)})")
+    env_names_used = list({t.env_name for t in dist.tasks})
+    print(
+        f"Task distribution: {len(dist.tasks)} task instance(s) across "
+        f"{len(env_names_used)} MT10 env type(s): {', '.join(env_names_used)}"
+    )
 
     if args.demo_only:
         if args.load is None:
@@ -996,12 +1197,15 @@ if __name__ == "__main__":
             shaping_scale=args.shaping_scale,
             subgoal_threshold=args.subgoal_threshold,
             potential_alpha=args.potential_alpha,
+            alpha_anneal_iters=args.alpha_anneal_iters,
             algo=args.algo,
             eval_episodes=args.eval_episodes,
             n_demos=args.n_demos,
             save_dir=args.save_dir,
             device=args.device,
             verbose=True,
-            state_projection_fn=_mw_ee_projection,
+            state_projection_fn=None if args.no_projection else _mw_ee_projection,
+            dbscan_eps=args.dbscan_eps,
+            max_pool_size=args.max_pool_size,
             scripted_episodes=args.scripted_episodes,
         )

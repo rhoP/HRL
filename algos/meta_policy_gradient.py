@@ -165,6 +165,56 @@ def evaluate_meta_policy(
     return float(np.mean(successes))
 
 
+def evaluate_meta_policy_per_task(
+    meta_policy,
+    task_distribution,
+    n_episodes: int = 20,
+    max_steps: int  = 500,
+    device: str     = "cpu",
+) -> dict:
+    """Return {task_id: success_rate} for every task in the distribution.
+
+    Runs exactly n_episodes episodes per task (not sampled randomly) so each
+    task gets a fair, independent evaluation.
+    """
+    meta_policy.eval()
+    per_task = {}
+
+    for task in task_distribution.tasks:
+        successes = []
+        for _ in range(n_episodes):
+            env    = task.create_env()
+            result = env.reset()
+            s      = result[0] if isinstance(result, tuple) else result
+            done   = False
+            t      = 0
+            success = False
+
+            with torch.no_grad():
+                h = meta_policy.init_hidden(device)
+                while not done and t < max_steps:
+                    s_arr  = np.asarray(s, dtype=np.float32)
+                    a_dist = meta_policy.forward_with_hidden(s_arr, h)
+                    a      = a_dist.sample()
+                    a_np   = a.cpu().numpy().flatten()
+                    a_env  = int(a_np[0]) if meta_policy.discrete else a_np
+
+                    s_next, r_env, terminated, truncated, info = env.step(a_env)
+                    done    = terminated or truncated
+                    success = success or bool(info.get("success", 0.0) > 0.5)
+                    h       = meta_policy.update_hidden(s_arr, a_np, r_env, h)
+                    s       = s_next
+                    t      += 1
+
+            env.close()
+            successes.append(float(success))
+
+        per_task[task.id] = float(np.mean(successes))
+
+    meta_policy.train()
+    return per_task
+
+
 # ── Episode collection (behaviour policy, no gradients) ────────────────────
 
 @torch.no_grad()

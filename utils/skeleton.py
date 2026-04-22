@@ -21,7 +21,7 @@ from morse import build_meta_morse_complex   # noqa: E402
 def build_skeleton(
     replay_buffer,
     state_dim: int,
-    action_dim: int              = None,
+    action_dim                   = None,
     num_landmarks: int           = 32,
     nu: int                      = 1,
     max_dim: int                 = 1,
@@ -39,7 +39,8 @@ def build_skeleton(
     device: str                  = "cpu",
     verbose: bool                = True,
     survived_only: bool          = False,
-    dbscan_eps: float            = None,
+    dbscan_eps                   = None,
+    max_pool_size                = None,
 ) -> dict:
     """
     Build the Meta-Morse skeleton from experience stored in `replay_buffer`.
@@ -82,6 +83,7 @@ def build_skeleton(
         verbose=verbose,
         survived_only=survived_only,
         dbscan_eps=dbscan_eps,
+        max_pool_size=max_pool_size,
     )
 
 

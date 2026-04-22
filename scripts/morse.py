@@ -890,8 +890,9 @@ def stratified_terminal_sampling(
     replay_buffer,
     gamma: float        = 0.99,
     strata: int         = 5,
-    survived_only: bool = False,
-    min_survived: int   = 1,
+    survived_only: bool  = False,
+    min_survived: int    = 1,
+    max_pool_size: "int | None" = None,
 ) -> list:
     """
     Sample states from multiple return strata to cover the full state space,
@@ -966,26 +967,32 @@ def stratified_terminal_sampling(
     else:
         weights = np.ones(len(candidates))
 
-    qs  = np.percentile(returns, np.linspace(0, 100, strata + 1))
-    pool = []
+    qs          = np.percentile(returns, np.linspace(0, 100, strata + 1))
+    # Assign every episode to a stratum in one vectorised pass — O(N log strata)
+    # instead of re-scanning candidates strata times.
+    stratum_ids = np.searchsorted(qs[1:-1], returns)  # shape (N,)
+
+    segments = []
     for si in range(strata):
-        lo = qs[si]
-        hi = qs[si + 1] + (1e-6 if si == strata - 1 else 0.0)
-        for i, info in enumerate(candidates):
-            if not (lo <= info["G"] < hi):
-                continue
-            w = weights[i]
+        for i in np.where(stratum_ids == si)[0]:
+            info = candidates[i]
+            w    = weights[i]
             if w == 0.0:
                 continue
             ep     = info["ep"]
             states = np.asarray(ep["states"], dtype=np.float32)
             T      = info["T"]
-            mid_i  = T // 2
-            repeats = max(1, round(w * strata)) if use_is_weight else 1
+            seg    = states[T // 2 : T]
+            repeats = max(1, int(round(float(w) * strata))) if use_is_weight else 1
             for _ in range(repeats):
-                for t in range(mid_i, T):
-                    pool.append(states[t])
-    return pool
+                segments.append(seg)
+    if not segments:
+        return []
+    pool = np.concatenate(segments, axis=0)
+    if max_pool_size is not None and len(pool) > max_pool_size:
+        idx  = np.random.choice(len(pool), max_pool_size, replace=False)
+        pool = pool[idx]
+    return list(pool)
 
 
 def _check_topology_connectivity(simplices: dict, task_id: int, verbose: bool) -> int:
@@ -1215,7 +1222,7 @@ def meta_critical_states(
     task_critical: dict,
     landmark_states_np: np.ndarray,
     min_task_support: float  = 0.6,
-    eps: float               = None,
+    eps: "float | None"      = None,
     state_projection_fn      = None,
 ) -> dict:
     """
@@ -1293,10 +1300,15 @@ def compute_meta_centrality(
     candidate_subgoals: dict,
     landmark_states_np: np.ndarray,
     centrality_threshold: float = 0.0,
+    state_projection_fn=None,
 ) -> dict:
     """
     Filter candidate_subgoals by betweenness centrality in the meta-complex graph.
     Requires networkx.  If unavailable, returns candidate_subgoals unchanged.
+
+    state_projection_fn: when provided, landmarks are projected before distance
+        computations so they match the projected subgoal centroids from
+        meta_critical_states.
     """
     try:
         import networkx as nx
@@ -1311,10 +1323,18 @@ def compute_meta_centrality(
     if len(G.edges) == 0:
         return candidate_subgoals
 
+    # Project landmarks if subgoal centroids are stored in projected space.
+    if state_projection_fn is not None:
+        lm_for_dist = np.array(
+            [state_projection_fn(s) for s in landmark_states_np], dtype=np.float32
+        )
+    else:
+        lm_for_dist = landmark_states_np
+
     centrality = nx.betweenness_centrality(G)
     filtered   = {}
     for sg_id, sg_data in candidate_subgoals.items():
-        dists     = np.linalg.norm(landmark_states_np - sg_data["state"], axis=1)
+        dists     = np.linalg.norm(lm_for_dist - sg_data["state"], axis=1)
         closest_v = int(np.argmin(dists))
         c_val     = float(centrality.get(closest_v, 0.0))
         if c_val >= centrality_threshold:
@@ -1368,8 +1388,9 @@ def build_meta_morse_complex(
     state_projection_fn          = None,
     device: str                  = "cpu",
     verbose: bool                = True,
-    survived_only: bool          = False,
-    dbscan_eps: float            = None,
+    survived_only: bool               = False,
+    dbscan_eps: "float | None"        = None,
+    max_pool_size: "int | None"       = None,
 ) -> dict:
     """
     Full Meta-MorseComplex pipeline (Meta-MorseComplex.md).
@@ -1390,9 +1411,11 @@ def build_meta_morse_complex(
     # ── Step 1: landmark selection ────────────────────────────────────────
     if verbose:
         print("  [MetaMorse] Step 1: stratified terminal sampling...")
+    _max_pool = max_pool_size if max_pool_size is not None else num_landmarks * 20
     pool_states = stratified_terminal_sampling(
         replay_buffer, gamma=gamma, strata=5,
         survived_only=survived_only,
+        max_pool_size=_max_pool,
     )
 
     if not pool_states:
@@ -1589,6 +1612,7 @@ def build_meta_morse_complex(
     meta_subgoals = compute_meta_centrality(
         meta_simplices, meta_subgoals, lm_np,
         centrality_threshold=centrality_threshold,
+        state_projection_fn=state_projection_fn,
     )
     if verbose:
         print(f"             {len(meta_subgoals)} meta-subgoal(s) after centrality filter.")
@@ -1600,11 +1624,20 @@ def build_meta_morse_complex(
     critical_states: dict = {}
     phi_critical:    dict = {}
 
+    # Pre-project landmarks once for all subgoal distance lookups when subgoal
+    # centroids are stored in the projected space (set by meta_critical_states).
+    if state_projection_fn is not None:
+        lm_np_proj = np.array(
+            [state_projection_fn(s) for s in lm_np], dtype=np.float32
+        )
+    else:
+        lm_np_proj = lm_np
+
     if meta_subgoals:
         for sg_id, sg_data in meta_subgoals.items():
             critical_states[sg_id] = sg_data["state"]
             # Nearest landmark's meta_phi as this subgoal's phi
-            dists    = np.linalg.norm(lm_np - sg_data["state"], axis=1)
+            dists    = np.linalg.norm(lm_np_proj - sg_data["state"], axis=1)
             closest  = int(np.argmin(dists))
             phi_critical[sg_id] = float(meta_phi.get((closest,), 0.0))
     else:

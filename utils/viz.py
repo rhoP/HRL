@@ -186,15 +186,23 @@ def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
                 out.append(float("nan"))
         return out
 
-    keys   = ["total", "policy", "value", "entropy"]
-    labels = {"total": "Total loss", "policy": "Policy loss",
-              "value": "Value loss", "entropy": "Entropy"}
-    colors = {"total": _P["plum"], "policy": _P["blue"],
-              "value": _P["gold"], "entropy": _P["red"]}
+    keys = ["total", "policy", "value", "entropy"]
+    labels = {
+        "total": "Total loss",
+        "policy": "Policy loss",
+        "value": "Value loss",
+        "entropy": "Entropy",
+    }
+    colors = {
+        "total": _P["plum"],
+        "policy": _P["blue"],
+        "value": _P["gold"],
+        "entropy": _P["red"],
+    }
 
     # Concatenate all iterations into one flat series; record boundary positions
-    all_y: dict       = {k: [] for k in keys}
-    boundaries: list  = []   # global epoch index where each iteration ends
+    all_y: dict = {k: [] for k in keys}
+    boundaries: list = []  # global epoch index where each iteration ends
     offset = 0
     for run in phase4_losses:
         if not run:
@@ -226,19 +234,17 @@ def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
         if w < n_epochs:
             kernel = np.ones(w) / w
             smooth = np.convolve(y, kernel, mode="valid")
-            ax.plot(range(w - 1, n_epochs), smooth,
-                    color=colors[key], linewidth=2.0)
+            ax.plot(range(w - 1, n_epochs), smooth, color=colors[key], linewidth=2.0)
 
         # Iteration boundary lines
         for b in iter_boundaries:
-            ax.axvline(x=b, color=_P["mid"], linestyle="--",
-                       linewidth=0.9, alpha=0.7)
+            ax.axvline(x=b, color=_P["mid"], linestyle="--", linewidth=0.9, alpha=0.7)
 
         # Iteration labels just above the x-axis at each boundary
-        #ylim = ax.get_ylim()
-        #y_label = ylim[0] + (ylim[1] - ylim[0]) * 0.04
-        #for i, b in enumerate(iter_boundaries):
-        #    ax.text(b + n_epochs * 0.005, y_label, 
+        # ylim = ax.get_ylim()
+        # y_label = ylim[0] + (ylim[1] - ylim[0]) * 0.04
+        # for i, b in enumerate(iter_boundaries):
+        #    ax.text(b + n_epochs * 0.005, y_label,
         #            fontsize=6, color=_P["mid"], va="bottom")
 
         ax.set_title(labels[key], fontsize=10)
@@ -246,7 +252,7 @@ def plot_meta_loss(phase4_losses: list, save_dir: str) -> None:
         ax.grid(alpha=0.25)
 
     n_iters = len([r for r in phase4_losses if r])
-    #fig.suptitle(f"Meta-policy gradient losses  ({n_iters} iteration(s), "
+    # fig.suptitle(f"Meta-policy gradient losses  ({n_iters} iteration(s), "
     #            f"{n_epochs} total epochs)", fontsize=11)
     fig.tight_layout()
     out = os.path.join(save_dir, "metrics_meta_loss.png")
@@ -386,7 +392,7 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer, save_path: str) -
             cmap=CMAP_DIV,
         ),
         cax=ax_cb,
-        label="Morse value",
+        label="Marginal Potential",
     )
     fig_cb.tight_layout()
     _save_fig(fig_cb, cb_path)

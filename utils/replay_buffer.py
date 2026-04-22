@@ -212,6 +212,34 @@ class ReplayBuffer:
                 "task_id":    int(self._task_ids[start]),
             }
 
+    def remove_tasks(self, task_ids: set) -> int:
+        """Remove all transitions belonging to any of the given task IDs.
+
+        Returns the number of transitions removed.  Episode boundaries are
+        rebuilt from the surviving dones so iter_episodes() remains correct.
+        """
+        if not task_ids or not self._states:
+            return 0
+
+        keep = [i for i, tid in enumerate(self._task_ids) if tid not in task_ids]
+        if len(keep) == len(self._states):
+            return 0
+
+        removed = len(self._states) - len(keep)
+
+        self._states      = [self._states[i]      for i in keep]
+        self._actions     = [self._actions[i]      for i in keep]
+        self._rewards     = [self._rewards[i]      for i in keep]
+        self._next_states = [self._next_states[i]  for i in keep]
+        self._dones       = [self._dones[i]        for i in keep]
+        self._terminated  = [self._terminated[i]   for i in keep]
+        self._task_ids    = [self._task_ids[i]      for i in keep]
+
+        # Rebuild episode-end index from surviving dones.
+        self._ep_ends = [i + 1 for i, d in enumerate(self._dones) if d]
+
+        return removed
+
     def get_all_states(self) -> torch.Tensor:
         """All stored states as a float32 tensor [N, state_dim]."""
         if not self._states:

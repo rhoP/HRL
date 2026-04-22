@@ -282,6 +282,54 @@ class EmpiricalHittingTimePotential:
         return self.get_potential(s_next, sg_id) - self.get_potential(s, sg_id)
 
 
+# ── Alpha scheduler ───────────────────────────────────────────────────────
+
+class AlphaScheduler:
+    """Linear schedule for the CombinedPotential mixing coefficient α.
+
+    α controls the skeleton-vs-empirical balance:
+        α = 1.0  →  pure skeleton (graph topology)
+        α = 0.0  →  pure empirical (k-NN hitting-time returns)
+
+    The intended direction is high→low: lean on the skeleton early when the
+    empirical potential has little data, then shift trust to the empirical
+    component as the replay buffer grows across iterations.
+
+        α(i) = alpha_start + (alpha_end − alpha_start) × min(1, i / anneal_iters)
+
+    With defaults (alpha_start=0.5, alpha_end=0.0, anneal_iters=3):
+        iteration 0 → 0.500
+        iteration 1 → 0.333
+        iteration 2 → 0.167
+        iteration 3 → 0.000  (held at alpha_end for all subsequent iterations)
+    """
+
+    def __init__(
+        self,
+        alpha_start:  float = 0.5,
+        alpha_end:    float = 0.0,
+        anneal_iters: int   = 3,
+    ):
+        if not (0.0 <= alpha_start <= 1.0):
+            raise ValueError(f"alpha_start must be in [0, 1], got {alpha_start}")
+        if not (0.0 <= alpha_end <= 1.0):
+            raise ValueError(f"alpha_end must be in [0, 1], got {alpha_end}")
+        self.alpha_start  = float(alpha_start)
+        self.alpha_end    = float(alpha_end)
+        self.anneal_iters = max(1, int(anneal_iters))
+
+    def alpha(self, iteration: int) -> float:
+        """Return the scheduled α for the given 0-based iteration index."""
+        t = min(1.0, iteration / self.anneal_iters)
+        return self.alpha_start + (self.alpha_end - self.alpha_start) * t
+
+    def __repr__(self) -> str:
+        return (
+            f"AlphaScheduler(α {self.alpha_start:.3f}→{self.alpha_end:.3f} "
+            f"over {self.anneal_iters} iter(s))"
+        )
+
+
 # ── Combined potential ────────────────────────────────────────────────────
 
 class CombinedPotential:
