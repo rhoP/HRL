@@ -899,6 +899,21 @@ def main_meta_rl_loop(
         training_skeleton = dict(skeleton)
         training_skeleton["skeleton_potential"] = potential
 
+        def _phase4_graduation_callback(newly_graduated):
+            new_ids = {t.id for t in newly_graduated}
+            for t in newly_graduated:
+                graduated_task_ids.add(t.id)
+                if verbose:
+                    print(f"  [Phase 4] ✓ Task {t.env_name} (id={t.id}) reached 100% — dropping mid-training")
+            task_distribution.tasks = [
+                t for t in task_distribution.tasks if t.id not in graduated_task_ids
+            ]
+            removed = rb.remove_tasks(new_ids)
+            save_replay_buffer(rb, rb_path)
+            if verbose:
+                remaining = [t.env_name for t in task_distribution.tasks]
+                print(f"  [Phase 4] Removed {removed} transitions. Remaining: {remaining}")
+
         meta_policy, meta_value_net, p4_losses, training_state = (
             meta_policy_gradient_with_skeleton_shaping(
                 meta_policy,
@@ -912,6 +927,7 @@ def main_meta_rl_loop(
                 device=device,
                 verbose=verbose,
                 training_state=training_state,
+                graduation_callback=_phase4_graduation_callback,
             )
         )
         metrics["phase4_losses"].append(p4_losses)

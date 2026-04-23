@@ -336,6 +336,7 @@ def meta_policy_gradient_with_skeleton_shaping(
     device: str               = "cpu",
     verbose: bool             = True,
     training_state: dict      = None,
+    graduation_callback       = None,
     # ── Smooth shaping ─────────────────────────────────────────────────
     buffer_warmup_epochs: int  = -1,
     adaptive_shaping: bool     = True,
@@ -537,7 +538,7 @@ def meta_policy_gradient_with_skeleton_shaping(
             "ema_ratio_dev":    float(ema_ratio_dev),
         })
 
-        if verbose and (epoch + 1) % eval_every == 0:
+        if (epoch + 1) % eval_every == 0:
             sr = evaluate_meta_policy(
                 meta_policy, task_distribution,
                 n_episodes=eval_episodes, device=device,
@@ -546,15 +547,35 @@ def meta_policy_gradient_with_skeleton_shaping(
                 shaping_scale=shaping_scale,
                 subgoal_threshold=subgoal_threshold,
             )
-            avg_r      = float(np.mean(fresh_rewards)) if fresh_rewards else 0.0
-            mean_ratio = float(ratio.mean().item())
-            n_buf      = len(is_buffer)
-            print(f"  [PG] epoch {epoch+1}/{meta_epochs}  "
-                  f"buf={n_buf}ep  "
-                  f"scale={effective_shaping:.3f}  "
-                  f"IS_ratio={mean_ratio:.3f}  ema_dev={ema_ratio_dev:.3f}  "
-                  f"loss={total_loss.item():.4f}  "
-                  f"avg_r={avg_r:.4f}  sr={sr:.1%}")
+            if verbose:
+                avg_r      = float(np.mean(fresh_rewards)) if fresh_rewards else 0.0
+                mean_ratio = float(ratio.mean().item())
+                n_buf      = len(is_buffer)
+                print(f"  [PG] epoch {epoch+1}/{meta_epochs}  "
+                      f"buf={n_buf}ep  "
+                      f"scale={effective_shaping:.3f}  "
+                      f"IS_ratio={mean_ratio:.3f}  ema_dev={ema_ratio_dev:.3f}  "
+                      f"loss={total_loss.item():.4f}  "
+                      f"avg_r={avg_r:.4f}  sr={sr:.1%}")
+
+            # Per-task graduation check
+            per_task_sr = evaluate_meta_policy_per_task(
+                meta_policy, task_distribution,
+                n_episodes=eval_episodes, device=device,
+            )
+            newly_graduated = [
+                t for t in task_distribution.tasks
+                if per_task_sr.get(t.id, 0.0) >= 1.0
+            ]
+            if newly_graduated:
+                if graduation_callback is not None:
+                    graduation_callback(newly_graduated)
+                # Refresh round-robin list after task_distribution may have changed
+                task_list = list(task_distribution.tasks)
+                n_tasks   = len(task_list)
+                task_cursor = 0
+                if n_tasks == 0:
+                    break
 
     return meta_policy, meta_value_net, epoch_losses, {
         "meta_value_net":      meta_value_net,
