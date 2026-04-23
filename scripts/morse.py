@@ -1550,7 +1550,21 @@ def build_meta_morse_complex(
 
         t_crit_states = {sigma[0]: landmark_states[sigma[0]].cpu().numpy()
                          for sigma in persistent.get(0, [])}
-        if verbose:
+
+        if not t_crit_states:
+            # Fallback: relax the persistence gap to 0 (pure Forman criticality)
+            # so that the task still contributes critical states to the intersection.
+            almost = _persistent_critical_simplices(
+                t_simplices, morse_vals_norm, persistence_threshold=0.0,
+            )
+            t_crit_states = {sigma[0]: landmark_states[sigma[0]].cpu().numpy()
+                             for sigma in almost.get(0, [])}
+            if verbose:
+                print(
+                    f"      0 persistent critical state(s) — "
+                    f"using {len(t_crit_states)} almost-persistent (threshold=0)."
+                )
+        elif verbose:
             print(f"      {len(t_crit_states)} persistent critical state(s).")
 
         task_phi_values[tid] = phi_vals

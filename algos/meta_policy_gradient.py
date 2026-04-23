@@ -373,8 +373,8 @@ def meta_policy_gradient_with_skeleton_shaping(
     flush_buffer=True (new iteration) the EMA and effective_shaping are reset
     to 0 / shaping_scale so each iteration starts fresh.
     """
-    meta_subgoals      = skeleton_data["meta_subgoals"]
-    skeleton_potential = skeleton_data["skeleton_potential"]
+    meta_subgoals      = skeleton_data.get("meta_subgoals")
+    skeleton_potential = skeleton_data.get("skeleton_potential")
 
     n_tasks             = len(task_distribution.tasks)
     episodes_per_update = max(1, min(episodes_per_update, n_tasks))

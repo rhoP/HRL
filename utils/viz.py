@@ -356,8 +356,22 @@ def plot_skeleton_topology(skeleton_data: dict, replay_buffer, save_path: str) -
     if c_ids:
         crit_arr = np.stack(
             [np.asarray(critical_states[k], dtype=np.float32) for k in c_ids]
-        )  # [K, D]
-        crit_xy = pca.transform(crit_arr) if pca is not None else crit_arr[:, :2]
+        )  # [K, D_crit]
+        crit_d = crit_arr.shape[-1]
+        if pca is not None and crit_d == D:
+            crit_xy = pca.transform(crit_arr)
+        elif pca is not None and crit_d != D:
+            # Critical centroids are in a projected subspace (e.g. 8D EE space).
+            # Find the nearest landmark in the shared leading dimensions and use
+            # that landmark's 2D PCA position as a proxy.
+            min_d = min(D, crit_d)
+            L_sub = L_np[:, :min_d]        # [L, min_d]
+            c_sub = crit_arr[:, :min_d]    # [K, min_d]
+            dists = np.linalg.norm(L_sub[:, None] - c_sub[None, :], axis=-1)  # [L, K]
+            nearest = dists.argmin(axis=0)  # [K]
+            crit_xy = L_2d[nearest]
+        else:
+            crit_xy = crit_arr[:, :2]
         ax.scatter(
             crit_xy[:, 0],
             crit_xy[:, 1],
