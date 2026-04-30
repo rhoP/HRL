@@ -41,6 +41,7 @@ from algos.potential import (
     CombinedPotential,
     ShapedRewardWrapper,
 )
+from algos.progress import blend_with_progress
 from algos.meta_policy_gradient import (
     meta_policy_gradient_with_skeleton_shaping,
     evaluate_meta_policy,
@@ -750,6 +751,10 @@ def main_meta_rl_loop(
     save_dir: str = "results/meta_rl",
     device: str = "cpu",
     verbose: bool = True,
+    use_progress: bool = False,
+    progress_latent_dim: int = 64,
+    progress_epochs: int = 10,
+    progress_weight: float = 0.5,
 ):
     """
     Full meta-RL pipeline:
@@ -862,6 +867,22 @@ def main_meta_rl_loop(
             verbose=verbose,
             state_projection_fn=state_projection_fn,
         )
+
+        # Phase 2b — optionally blend with learned progress estimator
+        if use_progress:
+            if verbose:
+                print("[Phase 2b] Blending with progress estimator...")
+            potential = blend_with_progress(
+                potential,
+                rb,
+                state_dim=state_dim,
+                latent_dim=progress_latent_dim,
+                epochs=progress_epochs,
+                base_weight=1.0 - progress_weight,
+                progress_weight=progress_weight,
+                device=device,
+                verbose=verbose,
+            )
 
         # Phase 3
         if verbose:
@@ -1108,7 +1129,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--landmarks", type=int, default=500)
-    parser.add_argument("--meta-epochs", type=int, default=500)
+    parser.add_argument("--meta-epochs", type=int, default=300)
     parser.add_argument("--task-steps", type=int, default=10_000)
     parser.add_argument("--timesteps", type=int, default=50_000)
     parser.add_argument("--shaping-scale", type=float, default=1.0)
@@ -1131,15 +1152,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--scripted-episodes",
         type=int,
-        default=10,
+        default=50,
         help="expert scripted-policy episodes per task added to the Phase 0 buffer "
-        "(default: 10; set 0 to disable)",
+        "(default: 100; set 0 to disable)",
     )
     parser.add_argument(
         "--alpha-anneal-iters",
         type=int,
-        default=3,
-        help="iterations over which to anneal potential_alpha from its start value to 0 (default: 3)",
+        default=2,
+        help="iterations over which to anneal potential_alpha from its start value to 0 (default: 2)",
     )
     parser.add_argument(
         "--dbscan-eps",
@@ -1158,6 +1179,29 @@ if __name__ == "__main__":
         "--no-projection",
         action="store_true",
         help="disable the MetaWorld task-agnostic end-effector state projection",
+    )
+    parser.add_argument(
+        "--use-progress",
+        action="store_true",
+        help="blend Phase-2 potential with a learned progress estimator (denser shaping)",
+    )
+    parser.add_argument(
+        "--progress-latent-dim",
+        type=int,
+        default=128,
+        help="encoder latent dimension for progress estimator (default: 64)",
+    )
+    parser.add_argument(
+        "--progress-epochs",
+        type=int,
+        default=20,
+        help="training epochs for progress estimator per iteration (default: 10)",
+    )
+    parser.add_argument(
+        "--progress-weight",
+        type=float,
+        default=0.5,
+        help="fraction of shaping from progress vs base potential (default: 0.5)",
     )
     parser.add_argument("--save-dir", default="results/meta_rl")
     parser.add_argument("--load", default=None, metavar="CKPT_DIR")
@@ -1224,4 +1268,8 @@ if __name__ == "__main__":
             dbscan_eps=args.dbscan_eps,
             max_pool_size=args.max_pool_size,
             scripted_episodes=args.scripted_episodes,
+            use_progress=args.use_progress,
+            progress_latent_dim=args.progress_latent_dim,
+            progress_epochs=args.progress_epochs,
+            progress_weight=args.progress_weight,
         )

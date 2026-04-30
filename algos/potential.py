@@ -26,6 +26,41 @@ def _to_numpy_f32(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
+# ── Hit-threshold calibration ─────────────────────────────────────────────
+
+def calibrate_hit_threshold(
+    replay_buffer,
+    fraction:  float = 0.05,
+    n_sample:  int   = 500,
+    n_pairs:   int   = 5_000,
+) -> float:
+    """Return fraction × median pairwise L2 distance among sampled buffer states.
+
+    Replaces the hand-tuned hit_threshold=10.0 with a value that adapts to
+    the actual scale of the state space.  Works across environments where
+    dimensions have very different units (e.g. joint angles vs. velocities).
+    """
+    states = replay_buffer.get_all_states()
+    if hasattr(states, "cpu"):
+        states = states.cpu().numpy()
+    states = np.asarray(states, dtype=np.float32)
+    n = len(states)
+    if n < 2:
+        return 1.0
+    if n > n_sample:
+        idx = np.random.choice(n, n_sample, replace=False)
+        states = states[idx]
+        n = n_sample
+    # Random pairs — avoids materialising the full O(n²) distance matrix
+    n_pairs = min(n_pairs, n * (n - 1) // 2)
+    i1 = np.random.randint(0, n, n_pairs)
+    i2 = np.random.randint(0, n, n_pairs)
+    same = i1 == i2
+    i2[same] = (i2[same] + 1) % n          # ensure no self-pairs
+    dists = np.linalg.norm(states[i1] - states[i2], axis=1)
+    return max(float(fraction * np.median(dists)), 1e-3)
+
+
 # ── Nearest-subgoal lookup ─────────────────────────────────────────────────
 
 def _nearest_subgoal(s, meta_subgoals: dict, state_projection_fn=None):
@@ -336,25 +371,27 @@ class CombinedPotential:
     """
     Φ(s; c) = α · Φ̃_skel(s; c)  +  (1−α) · Φ̃_emp(s; c)
 
-    Each component is normalised to unit standard deviation over a sample of
-    (landmark, subgoal) evaluations before mixing, making the convex combination
-    scale-invariant regardless of the magnitude difference between hop-count
-    distances and discounted returns.
+    Each component is normalised to unit standard deviation of per-step ΔΦ
+    (sampled from consecutive replay-buffer pairs) before mixing.  Normalising
+    ΔΦ rather than Φ directly bounds the per-step shaping magnitude regardless
+    of the absolute scale of the potential or the episode length, preventing
+    the shaping term from overwhelming the environment reward signal.
+
+    When replay_buffer is None the fallback normalises by std(Φ) over landmark
+    samples, which is equivalent to the old behaviour.
 
     α = 1.0  →  pure graph topology (SkeletonPotential)
     α = 0.0  →  pure empirical hitting-time returns (EmpiricalHittingTimePotential)
-
-    When the empirical component has no hitting trajectories yet (empty buffer),
-    its std is 0 → scale falls back to 1.0 and all empirical values are 0, so
-    the combined potential degrades gracefully to the pure skeleton signal.
     """
 
     def __init__(
         self,
         skeleton_potential,
         empirical_potential,
-        landmarks:  np.ndarray,
-        alpha: float = 0.5,
+        landmarks:   np.ndarray,
+        alpha:       float = 0.5,
+        replay_buffer      = None,
+        n_delta_pairs: int = 500,
     ):
         if not (0.0 <= alpha <= 1.0):
             raise ValueError(f"alpha must be in [0, 1], got {alpha}")
@@ -363,13 +400,55 @@ class CombinedPotential:
         self._emp     = empirical_potential
         self.alpha    = alpha
 
-        landmarks        = _to_numpy_f32(landmarks)
-        self._skel_scale = self._estimate_scale(skeleton_potential, landmarks)
-        self._emp_scale  = self._estimate_scale(empirical_potential, landmarks)
+        landmarks = _to_numpy_f32(landmarks)
+        if replay_buffer is not None:
+            self._skel_scale = self._estimate_delta_scale(
+                skeleton_potential, replay_buffer, n_delta_pairs,
+            )
+            self._emp_scale = self._estimate_delta_scale(
+                empirical_potential, replay_buffer, n_delta_pairs,
+            )
+        else:
+            self._skel_scale = self._estimate_scale(skeleton_potential, landmarks)
+            self._emp_scale  = self._estimate_scale(empirical_potential, landmarks)
+
+    @staticmethod
+    def _estimate_delta_scale(pot, replay_buffer, n_pairs: int = 500) -> float:
+        """Std of per-step ΔΦ = Φ(s')−Φ(s) over consecutive replay pairs.
+
+        Sampling ΔΦ rather than Φ directly ties the normalisation to the
+        actual per-step shaping magnitude seen during training, so the shaped
+        reward remains on the same scale as the environment reward regardless
+        of episode length or potential topology.
+        """
+        if not pot.subgoals:
+            return 1.0
+        deltas = []
+        for ep in replay_buffer.iter_episodes():
+            states = np.asarray(ep["states"], dtype=np.float32)
+            T = len(states) - 1
+            for t in range(T):
+                sg_id, _ = _nearest_subgoal(states[t + 1], pot.subgoals)
+                if sg_id is None:
+                    continue
+                try:
+                    delta = (pot.get_potential(states[t + 1], sg_id)
+                             - pot.get_potential(states[t],     sg_id))
+                    deltas.append(delta)
+                except Exception:
+                    pass
+                if len(deltas) >= n_pairs:
+                    break
+            if len(deltas) >= n_pairs:
+                break
+        if len(deltas) < 2:
+            return 1.0
+        std = float(np.std(deltas))
+        return std if std > 1e-8 else 1.0
 
     @staticmethod
     def _estimate_scale(pot, landmarks: np.ndarray) -> float:
-        """Std of get_potential over up to 50 landmarks × all subgoals."""
+        """Fallback: std of Φ over up to 50 landmarks × all subgoals."""
         if landmarks is None or len(landmarks) == 0 or not pot.subgoals:
             return 1.0
         lm_sample = landmarks[: min(len(landmarks), 50)]

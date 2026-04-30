@@ -50,6 +50,8 @@ if _ROOT not in sys.path:
 torch.set_default_dtype(torch.float32)
 
 from algos.potential import (
+    AlphaScheduler,
+    calibrate_hit_threshold,
     CombinedPotential,
     EmpiricalHittingTimePotential,
     ShapedRewardWrapper,
@@ -188,10 +190,14 @@ def phase2_build_potential(
     alpha: float = 0.5,
     k: int = 10,
     gamma: float = 0.9999,
-    hit_threshold: float = 10.0,
+    hit_threshold: float = None,
     verbose: bool = True,
 ):
     """Build CombinedPotential from topology + empirical hitting times."""
+    if hit_threshold is None:
+        hit_threshold = calibrate_hit_threshold(replay_buffer)
+        if verbose:
+            print(f"  [Phase 2] hit_threshold auto-calibrated → {hit_threshold:.4g}")
     raw = skeleton.get("meta_subgoals") or skeleton.get("critical_states", {})
     if raw and not isinstance(next(iter(raw.values())), dict):
         raw = {k_: {"state": v} for k_, v in raw.items()}
@@ -230,7 +236,8 @@ def phase2_build_potential(
             f"{n_covered}/{len(meta_subgoals)} subgoals covered"
         )
 
-    combined = CombinedPotential(skel_pot, emp_pot, lm_np, alpha=alpha)
+    combined = CombinedPotential(skel_pot, emp_pot, lm_np, alpha=alpha,
+                                 replay_buffer=replay_buffer)
     if verbose:
         print(
             f"  [Phase 2] CombinedPotential  α={alpha:.2f}  "
@@ -514,12 +521,14 @@ def main():
     parser.add_argument("--landmarks",      type=int, default=200,
                         help="FPS landmark count (default: 32)")
     parser.add_argument("--alpha",          type=float, default=0.5,
-                        help="Potential mix: 1=pure topology, 0=pure empirical (default: 0.5)")
+                        help="Potential mix starting value: 1=pure topology, 0=pure empirical (default: 0.5)")
+    parser.add_argument("--alpha-anneal-iters", type=int, default=3,
+                        help="Iterations to anneal α→0 (default: 3)")
     parser.add_argument("--shaping-scale",  type=float, default=1.0,
                         help="Intrinsic reward coefficient (default: 1.0)")
     parser.add_argument("--gamma",          type=float, default=0.999,
-                        help="Discount factor (default: 0.95)")
-    parser.add_argument("--refine-every",   type=int, default=1,
+                        help="Discount factor (default: 0.99)")
+    parser.add_argument("--refine-every",   type=int, default=2,
                         help="Rebuild skeleton every N iterations (default: 1=every)")
     parser.add_argument("--save-dir",       default="results/mujoco_single",
                         help="Output directory (default: results/mujoco_single)")
@@ -590,6 +599,13 @@ def main():
     metrics = {"iterations": [], "eval_returns": []}
     skeleton = None
 
+    _alpha_sched = AlphaScheduler(
+        alpha_start=args.alpha, alpha_end=0.0,
+        anneal_iters=args.alpha_anneal_iters,
+    )
+    if verbose:
+        print(f"  alpha schedule: {_alpha_sched}")
+
     for iteration in range(args.iterations):
         if verbose:
             print(f"\n{'─' * 60}")
@@ -625,14 +641,15 @@ def main():
                 print("\n[Phase 1] Reusing skeleton from previous iteration.")
 
         # ── Phase 2: potential ─────────────────────────────────────────────
+        current_alpha = _alpha_sched.alpha(iteration)
         n_sub = len((skeleton or {}).get("meta_subgoals")
                     or (skeleton or {}).get("critical_states", {}))
         if skeleton is not None and n_sub > 0:
             if verbose:
-                print("\n[Phase 2] Building potential...")
+                print(f"\n[Phase 2] Building potential  α={current_alpha:.3f}...")
             potential = phase2_build_potential(
                 skeleton, rb,
-                alpha=args.alpha,
+                alpha=current_alpha,
                 gamma=args.gamma,
                 verbose=verbose,
             )

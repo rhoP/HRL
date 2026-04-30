@@ -10,6 +10,69 @@ import torch
 import torch.nn as nn
 
 
+# ── Squashed Gaussian distribution ────────────────────────────────────────────
+
+
+class TanhNormal:
+    """
+    Squashed Gaussian: a = action_scale * tanh(z) + action_bias, z ~ N(loc, std).
+
+    Used for continuous action spaces with bounded range [low, high]:
+        action_scale = (high - low) / 2
+        action_bias  = (high + low) / 2
+
+    log_prob includes the log-abs-det-Jacobian so policy gradient updates account
+    for the tanh squashing.  entropy() uses the Normal upper bound (differentiable,
+    adequate as a small-coefficient regulariser).
+    """
+
+    def __init__(
+        self,
+        loc:          torch.Tensor,
+        scale:        torch.Tensor,
+        action_scale: torch.Tensor,
+        action_bias:  torch.Tensor,
+    ):
+        self._normal      = torch.distributions.Normal(loc, scale)
+        self.action_scale = action_scale
+        self.action_bias  = action_bias
+
+    def sample(self) -> torch.Tensor:
+        z = self._normal.sample()
+        return self.action_scale * torch.tanh(z) + self.action_bias
+
+    def rsample(self) -> torch.Tensor:
+        z = self._normal.rsample()
+        return self.action_scale * torch.tanh(z) + self.action_bias
+
+    def log_prob(self, a: torch.Tensor) -> torch.Tensor:
+        """
+        Log-prob of a squashed action a, summed over the action dimension.
+
+        Derivation:
+            u  = (a - action_bias) / action_scale  →  tanh(z)
+            z  = atanh(u)
+            log|da/dz| = log(action_scale) + log(1 - u²)
+            log p(a)   = log p_N(z) - log|da/dz|  (sum over dims)
+
+        Returns shape [*batch] (action dim contracted).
+        """
+        u = ((a - self.action_bias) / self.action_scale).clamp(-1 + 1e-6, 1 - 1e-6)
+        z = torch.atanh(u)
+        log_det = torch.log(self.action_scale) + torch.log1p(-u.pow(2) + 1e-6)
+        return (self._normal.log_prob(z) - log_det).sum(-1)
+
+    def entropy(self) -> torch.Tensor:
+        """
+        Normal entropy as a differentiable upper-bound proxy for TanhNormal entropy.
+        Adequate with small entropy_coef; summed over action dims.
+        """
+        return self._normal.entropy().sum(-1)
+
+
+# ── Meta-policy ───────────────────────────────────────────────────────────────
+
+
 class MetaPolicy(nn.Module):
     """
     π_θ(a | s, τ) — meta-policy conditioned on current state and task history.
@@ -18,21 +81,31 @@ class MetaPolicy(nn.Module):
     A GRU encodes the history into a context vector that is concatenated with
     the current state before the action head.
 
+    For continuous actions the distribution is TanhNormal:
+        a = action_scale * tanh(z) + action_bias,  z ~ N(μ, σ)
+    where action_scale = (action_high − action_low) / 2 and
+          action_bias  = (action_high + action_low) / 2.
+    Samples are therefore guaranteed to lie in [action_low, action_high].
+
     Args:
-        state_dim:  observation dimensionality
-        action_dim: number of discrete actions, or continuous action dimension
-        hidden_dim: width of the MLP action head
-        gru_hidden: GRU hidden-state size
-        discrete:   True → Categorical output; False → Normal output
+        state_dim:   observation dimensionality
+        action_dim:  number of discrete actions, or continuous action dimension
+        hidden_dim:  width of the MLP action head
+        gru_hidden:  GRU hidden-state size
+        discrete:    True → Categorical output; False → TanhNormal output
+        action_low:  lower bound of continuous action space (scalar, default −1)
+        action_high: upper bound of continuous action space (scalar, default +1)
     """
 
     def __init__(
         self,
-        state_dim:  int,
-        action_dim: int,
-        hidden_dim: int = 256,
-        gru_hidden: int = 128,
-        discrete:   bool = True,
+        state_dim:   int,
+        action_dim:  int,
+        hidden_dim:  int   = 256,
+        gru_hidden:  int   = 128,
+        discrete:    bool  = True,
+        action_low:  float = -1.0,
+        action_high: float =  1.0,
     ):
         super().__init__()
         self.state_dim  = state_dim
@@ -52,8 +125,19 @@ class MetaPolicy(nn.Module):
         )
         if not discrete:
             self.log_std = nn.Parameter(torch.zeros(action_dim))
+            a_scale = (action_high - action_low) / 2.0
+            a_bias  = (action_high + action_low) / 2.0
+            self.register_buffer("action_scale",
+                                 torch.tensor(a_scale, dtype=torch.float32))
+            self.register_buffer("action_bias",
+                                 torch.tensor(a_bias,  dtype=torch.float32))
 
     # ------------------------------------------------------------------
+
+    def _tanh_normal(self, loc: torch.Tensor) -> TanhNormal:
+        """Build TanhNormal from policy head output loc."""
+        std = self.log_std.exp().clamp(1e-6, 1.0).expand_as(loc)
+        return TanhNormal(loc, std, self.action_scale, self.action_bias)
 
     def _encode_action(self, a) -> torch.Tensor:
         """Return a float tensor of shape [action_dim] for any action type."""
@@ -104,7 +188,9 @@ class MetaPolicy(nn.Module):
             s: current observation — np.ndarray or tensor [state_dim]
             h: GRU context          — Tensor [1, gru_hidden]
 
-        Returns the same distribution type as forward().
+        Returns:
+            Categorical  (discrete)
+            TanhNormal   (continuous) — samples lie in [action_low, action_high]
         """
         device = next(self.parameters()).device
         if isinstance(s, torch.Tensor):
@@ -118,9 +204,7 @@ class MetaPolicy(nn.Module):
 
         if self.discrete:
             return torch.distributions.Categorical(logits=logits)
-        mean = logits
-        std  = self.log_std.exp().clamp(1e-6, 1.0).expand_as(mean)
-        return torch.distributions.Normal(mean, std)
+        return self._tanh_normal(logits)
 
     def update_hidden(self, s, a, r: float, h: torch.Tensor) -> torch.Tensor:
         """
@@ -161,7 +245,7 @@ class MetaPolicy(nn.Module):
 
         Args:
             states_t:        [T, state_dim]
-            actions_t:       [T] int (discrete) or [T, action_dim] float (continuous)
+            actions_t:       [T] int (discrete) or [T, action_dim] squashed float
             hidden_states_t: [T, gru_hidden] — frozen behaviour context (detached)
 
         Returns:
@@ -179,13 +263,78 @@ class MetaPolicy(nn.Module):
             log_probs = dist.log_prob(actions_t.to(device).view(-1).long())
             entropies = dist.entropy()
         else:
-            mean      = logits
-            std       = self.log_std.exp().clamp(1e-6, 1.0).expand_as(mean)
-            dist      = torch.distributions.Normal(mean, std)
-            log_probs = dist.log_prob(actions_t.to(device)).sum(-1)
-            entropies = dist.entropy().sum(-1)
+            dist      = self._tanh_normal(logits)
+            log_probs = dist.log_prob(actions_t.to(device))
+            entropies = dist.entropy()
 
         return log_probs, entropies
+
+    def evaluate_actions_gru(
+        self,
+        states_t:         torch.Tensor,
+        actions_t:        torch.Tensor,
+        shaped_rewards_t: torch.Tensor,
+    ) -> tuple:
+        """
+        Re-roll the GRU from scratch over the episode sequence and evaluate
+        log-probs, entropies, and GRU context under the current parameters.
+
+        Unlike evaluate_actions, the GRU is actually called here, so
+        self.gru.weight_* receive gradients during backprop.
+
+        Context timing: at step t the action was chosen using h_t (the hidden
+        state BEFORE processing step t's transition). We reproduce this by
+        prepending the zero initial state and using out[0, :T-1] for steps 1..T.
+
+        Args:
+            states_t:         [T, state_dim]
+            actions_t:        [T] int (discrete) or [T, action_dim] squashed float
+            shaped_rewards_t: [T]  shaped reward at each step (GRU input)
+
+        Returns:
+            log_probs  Tensor [T]
+            entropies  Tensor [T]
+            ctx        Tensor [T, gru_hidden]  — differentiable; detach before
+                       passing to value network to keep gradients separate
+        """
+        device = next(self.parameters()).device
+        T      = states_t.size(0)
+        s      = states_t.to(device)[:, : self.state_dim]         # [T, sd]
+        r      = shaped_rewards_t.to(device).unsqueeze(-1)        # [T, 1]
+
+        if self.gru_hidden > 0 and self.gru is not None:
+            # Build GRU input: same layout as _encode_tau
+            if self.discrete:
+                # One-hot encode stored integer actions → [T, action_dim]
+                idx = actions_t.to(device).view(-1).long() % self.action_dim
+                a   = torch.zeros(T, self.action_dim, device=device)
+                a.scatter_(1, idx.unsqueeze(1), 1.0)
+            else:
+                a = actions_t.to(device)                           # [T, action_dim]
+            seq    = torch.cat([s, a, r], dim=-1).unsqueeze(0)    # [1, T, step_dim]
+            h0     = torch.zeros(1, 1, self.gru_hidden, device=device)
+            out, _ = self.gru(seq, h0)                            # [1, T, gru_hidden]
+            out    = out.squeeze(0)                               # [T, gru_hidden]
+            # ctx[t] = h_t = state before step t saw its transition.
+            # h_0 (zeros) is context at t=0; out[t-1] is context at t≥1.
+            h0_row = torch.zeros(1, self.gru_hidden, device=device)
+            ctx    = torch.cat([h0_row, out[:-1]], dim=0) if T > 1 else h0_row
+        else:
+            ctx = torch.zeros(T, self.gru_hidden, device=device)
+
+        head_in = torch.cat([s, ctx], dim=-1)                     # [T, sd+H]
+        logits  = self.policy_head(head_in)                       # [T, action_dim]
+
+        if self.discrete:
+            dist      = torch.distributions.Categorical(logits=logits)
+            log_probs = dist.log_prob(actions_t.to(device).view(-1).long())
+            entropies = dist.entropy()
+        else:
+            dist      = self._tanh_normal(logits)
+            log_probs = dist.log_prob(actions_t.to(device))
+            entropies = dist.entropy()
+
+        return log_probs, entropies, ctx
 
     # ------------------------------------------------------------------
 
@@ -196,8 +345,8 @@ class MetaPolicy(nn.Module):
             tau: task history — list of (s, a, r) tuples (may be empty or None)
 
         Returns:
-            torch.distributions.Categorical  (discrete)
-            torch.distributions.Normal       (continuous)
+            Categorical  (discrete)
+            TanhNormal   (continuous)
         """
         if tau is None:
             tau = []
@@ -215,10 +364,7 @@ class MetaPolicy(nn.Module):
 
         if self.discrete:
             return torch.distributions.Categorical(logits=logits)
-        else:
-            mean = logits
-            std  = self.log_std.exp().clamp(1e-6, 1.0).expand_as(mean)
-            return torch.distributions.Normal(mean, std)
+        return self._tanh_normal(logits)
 
 
 class MetaValueNetwork(nn.Module):

@@ -241,3 +241,62 @@ def train_progress_estimator(
     encoder.eval()
     estimator.eval()
     return encoder, estimator
+
+
+def blend_with_progress(
+    base_potential,
+    replay_buffer,
+    state_dim: int,
+    latent_dim: int        = 64,
+    epochs: int            = 10,
+    base_weight: float     = 0.5,
+    progress_weight: float = 0.5,
+    device: str            = "cpu",
+    verbose: bool          = True,
+):
+    """
+    Train a ProgressEstimator on `replay_buffer` and blend it with `base_potential`.
+
+    Returns a MixedPotential when base_potential is available, a standalone
+    ProgressPotential otherwise.  Returns base_potential unchanged if training
+    produces no usable episode pairs (e.g. buffer has only failed episodes).
+
+    Intended as a drop-in post-processing step after any Phase-2 potential build:
+        potential = blend_with_progress(potential, replay_buffer, state_dim, ...)
+    """
+    if verbose:
+        print(
+            f"  [Progress] Training ProgressEstimator  "
+            f"latent_dim={latent_dim}  epochs={epochs}  "
+            f"base_w={base_weight:.2f}  prog_w={progress_weight:.2f}"
+        )
+
+    encoder, estimator = train_progress_estimator(
+        replay_buffer,
+        state_dim=state_dim,
+        latent_dim=latent_dim,
+        epochs=epochs,
+        survived_only=True,
+        device=device,
+        verbose=verbose,
+    )
+
+    if encoder is None:
+        if verbose:
+            print("  [Progress] No training pairs — keeping base potential unchanged.")
+        return base_potential
+
+    prog_pot = ProgressPotential(encoder, estimator, state_dim, device=device)
+
+    if base_potential is not None:
+        if verbose:
+            print("  [Progress] MixedPotential (base + progress) ready.")
+        return MixedPotential(
+            base_potential, prog_pot,
+            base_weight=base_weight,
+            prog_weight=progress_weight,
+        )
+
+    if verbose:
+        print("  [Progress] ProgressPotential only (no base potential).")
+    return prog_pot

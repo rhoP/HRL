@@ -54,6 +54,7 @@ from algos.meta_policy_gradient import (
 )
 from utils.replay_buffer import ReplayBuffer
 from utils.skeleton import build_skeleton, refine_skeleton
+from algos.progress import blend_with_progress
 from utils.checkpoint import (
     save_checkpoint,
     load_checkpoint,
@@ -594,6 +595,11 @@ def phase2_build_per_task_potentials(
     hit_threshold: float = 0.5,
     verbose: bool = True,
     state_projection_fn=None,
+    use_progress: bool = False,
+    progress_latent_dim: int = 64,
+    progress_epochs: int = 10,
+    progress_weight: float = 0.5,
+    device: str = "cpu",
 ) -> dict:
     """
     Build one CombinedPotential per task using that task's own subgoals.
@@ -604,7 +610,10 @@ def phase2_build_per_task_potentials(
     where the skeleton and empirical components are both computed from only
     that task's critical states and hitting trajectories.
 
-    Returns {task_id: CombinedPotential | None}.
+    When use_progress=True, blends each task's combined potential with a
+    ProgressEstimator trained on that task's replay buffer only.
+
+    Returns {task_id: CombinedPotential | MixedPotential | None}.
     """
     task_potentials: dict = {}
 
@@ -660,6 +669,23 @@ def phase2_build_per_task_potentials(
             )
 
         combined = CombinedPotential(skel_pot, emp_pot, lm_np, alpha=alpha)
+
+        if use_progress:
+            state_dim = lm_np.shape[-1]
+            if verbose:
+                print(f"  [Phase 2] Task {task_id}: blending with progress estimator...")
+            combined = blend_with_progress(
+                combined,
+                filtered_rb,
+                state_dim=state_dim,
+                latent_dim=progress_latent_dim,
+                epochs=progress_epochs,
+                base_weight=1.0 - progress_weight,
+                progress_weight=progress_weight,
+                device=device,
+                verbose=verbose,
+            )
+
         task_potentials[task_id] = combined
 
     return task_potentials
@@ -921,6 +947,10 @@ def main_intersection_rl_loop(
     save_dir: str = "results/intersection_rl",
     device: str = "cpu",
     verbose: bool = True,
+    use_progress: bool = False,
+    progress_latent_dim: int = 64,
+    progress_epochs: int = 10,
+    progress_weight: float = 0.5,
 ):
     """
     Full intersection meta-RL pipeline:
@@ -1049,6 +1079,11 @@ def main_intersection_rl_loop(
             gamma=gamma,
             verbose=verbose,
             state_projection_fn=state_projection_fn,
+            use_progress=use_progress,
+            progress_latent_dim=progress_latent_dim,
+            progress_epochs=progress_epochs,
+            progress_weight=progress_weight,
+            device=device,
         )
 
         # ── Phase 2b: intersection potential for meta-policy shaping ────────
@@ -1366,6 +1401,12 @@ if __name__ == "__main__":
         action="store_true",
         help="disable the MetaWorld task-agnostic end-effector state projection",
     )
+    parser.add_argument("--use-progress",        action="store_true",
+                        help="blend per-task potentials with a progress estimator")
+    parser.add_argument("--progress-latent-dim", type=int,   default=64)
+    parser.add_argument("--progress-epochs",     type=int,   default=10)
+    parser.add_argument("--progress-weight",     type=float, default=0.5,
+                        help="weight of progress shaping (0=none, 1=pure progress)")
     parser.add_argument("--save-dir",  default="results/intersection_rl")
     parser.add_argument("--load",      default=None, metavar="CKPT_DIR")
     parser.add_argument("--demo-only", action="store_true")
@@ -1425,4 +1466,8 @@ if __name__ == "__main__":
             dbscan_eps=args.dbscan_eps,
             max_pool_size=args.max_pool_size,
             scripted_episodes=args.scripted_episodes,
+            use_progress=args.use_progress,
+            progress_latent_dim=args.progress_latent_dim,
+            progress_epochs=args.progress_epochs,
+            progress_weight=args.progress_weight,
         )

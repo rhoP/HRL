@@ -104,8 +104,12 @@ def save_checkpoint(
     if meta_policy is not None:
         torch.save(meta_policy.state_dict(),
                    os.path.join(ckpt_dir, "meta_policy.pt"))
+        cfg = {"gru_hidden": meta_policy.gru_hidden}
+        if hasattr(meta_policy, "action_scale"):
+            cfg["action_scale"] = float(meta_policy.action_scale)
+            cfg["action_bias"]  = float(meta_policy.action_bias)
         with open(os.path.join(ckpt_dir, "model_config.json"), "w") as f:
-            json.dump({"gru_hidden": meta_policy.gru_hidden}, f)
+            json.dump(cfg, f)
     if meta_value_net is not None:
         torch.save(meta_value_net.state_dict(),
                    os.path.join(ckpt_dir, "meta_value_net.pt"))
@@ -176,9 +180,10 @@ def load_checkpoint(checkpoint_dir: str, device: str = "cpu") -> dict:
 
     mp_path = os.path.join(checkpoint_dir, "meta_policy.pt")
     if os.path.exists(mp_path):
-        result["meta_policy_state"]    = _load(mp_path)
-        result["meta_value_net_state"] = _load(
-            os.path.join(checkpoint_dir, "meta_value_net.pt"))
+        result["meta_policy_state"] = _load(mp_path)
+        mvn_path = os.path.join(checkpoint_dir, "meta_value_net.pt")
+        if os.path.exists(mvn_path):
+            result["meta_value_net_state"] = _load(mvn_path)
 
     # Task policies — store the directory path; restore_models loads them
     tp_dir = os.path.join(checkpoint_dir, "task_policies")
@@ -215,15 +220,23 @@ def restore_models(ckpt: dict, state_dim: int, action_dim: int,
     # Meta-policy
     meta_policy = meta_value_net = None
     if "meta_policy_state" in ckpt:
-        gru_hidden  = ckpt.get("model_config", {}).get("gru_hidden", 128)
+        cfg         = ckpt.get("model_config", {})
+        gru_hidden  = cfg.get("gru_hidden", 128)
+        a_scale     = cfg.get("action_scale", 1.0)
+        a_bias      = cfg.get("action_bias",  0.0)
+        action_low  = a_bias - a_scale
+        action_high = a_bias + a_scale
         meta_policy = MetaPolicy(state_dim, action_dim,
                                  discrete=discrete,
-                                 gru_hidden=gru_hidden).to(device)
+                                 gru_hidden=gru_hidden,
+                                 action_low=action_low,
+                                 action_high=action_high).to(device)
         meta_policy.load_state_dict(ckpt["meta_policy_state"])
         meta_policy.eval()
         meta_value_net = MetaValueNetwork(state_dim,
                                           meta_policy.gru_hidden).to(device)
-        meta_value_net.load_state_dict(ckpt["meta_value_net_state"])
+        if "meta_value_net_state" in ckpt:
+            meta_value_net.load_state_dict(ckpt["meta_value_net_state"])
         meta_value_net.eval()
 
     # Task policies (SB3)

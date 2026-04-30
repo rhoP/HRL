@@ -1,6 +1,6 @@
 """
-Meta-policy gradient training with skeleton-based reward shaping and
-importance-sampled (IS) off-policy correction.
+Meta-policy gradient training with advantage-weighted regression (AWR) and
+a cross-task replay buffer.
 
 Entry point:
     meta_policy_gradient_with_skeleton_shaping(meta_policy, task_distribution,
@@ -10,17 +10,22 @@ skeleton_data must contain:
     "meta_subgoals"       — {sg_id: {"state": np.ndarray}}
     "skeleton_potential"  — SkeletonPotential or EmpiricalHittingTimePotential
 
-Collection is fully off-policy: each episode is collected under torch.no_grad()
-and stored in a rolling TrajectoryBuffer together with the behaviour log-probs
-and frozen GRU context.  At each gradient step the current policy is
-re-evaluated via MetaPolicy.evaluate_actions, the IS ratio is computed and
-clipped (PPO-style), and the clipped surrogate loss is minimised.
+Each epoch:
+  1. Collect `episodes_per_update` episodes under the current policy (round-robin
+     over tasks) and add them to MetaPolicyBuffer.
+  2. Sample `episodes_per_batch` episodes (50% current task, 50% other tasks).
+  3. Re-roll the GRU for each episode, compute normalised advantages, and apply
+     advantage-weighted policy gradient (no IS clipping).
 
-Returns (meta_policy, meta_value_net, epoch_losses).
+Advantage weighting naturally suppresses stale / low-quality episodes, so the
+buffer can persist across iterations without poisoning training.
+
+Returns (meta_policy, meta_value_net, epoch_losses, training_state).
 """
 
 import os
 import sys
+import random
 from collections import deque
 
 import numpy as np
@@ -46,6 +51,7 @@ class RunningMeanStd:
 
     Persists across iterations so the normalizer tracks the full lifetime
     scale of returns, decoupling value-loss magnitude from shaping schedule.
+    Used for per-task return normalization in AWR.
     """
 
     def __init__(self, eps: float = 1e-4):
@@ -71,32 +77,97 @@ class RunningMeanStd:
         return (x - self.mean) / (self.var ** 0.5 + 1e-8)
 
 
-# ── IS trajectory buffer ───────────────────────────────────────────────────
+class EMANormalizer:
+    """Exponential moving average normalizer for per-step reward streams.
 
-class TrajectoryBuffer:
+    Unlike Welford, old observations decay so the normalizer adapts to
+    shifting reward distributions as the policy improves.  Used for the
+    per-task reward channel fed to the GRU; NOT used for return normalization
+    (returns use RunningMeanStd so the value baseline stays stable).
+
+    alpha=0.99 → effective window of ~100 steps.
     """
-    Rolling buffer of recent episodes for importance-sampled policy gradient.
-    Stores the last `max_episodes` collected episodes; older ones are evicted.
-    Each episode dict must contain:
-        states_t, actions_t, hidden_states_t, log_probs_old_t, returns_t
+
+    def __init__(self, alpha: float = 0.99, eps: float = 1e-4):
+        self.alpha        = alpha
+        self.eps          = eps
+        self.mean         = 0.0
+        self.var          = 1.0
+        self._initialized = False
+
+    def update(self, x: torch.Tensor) -> None:
+        x_flat     = x.detach().cpu().float().view(-1)
+        batch_mean = float(x_flat.mean())
+        batch_var  = float(x_flat.var()) if x_flat.numel() > 1 else 0.0
+        if not self._initialized:
+            self.mean         = batch_mean
+            self.var          = max(batch_var, self.eps)
+            self._initialized = True
+            return
+        delta     = batch_mean - self.mean
+        self.mean = self.alpha * self.mean + (1.0 - self.alpha) * batch_mean
+        self.var  = self.alpha * self.var  + (1.0 - self.alpha) * (batch_var + delta ** 2)
+        self.var  = max(self.var, self.eps)
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / (self.var ** 0.5 + 1e-8)
+
+
+# ── AWR replay buffer ──────────────────────────────────────────────────────
+
+class MetaPolicyBuffer:
+    """
+    Rolling replay buffer for advantage-weighted meta-policy training.
+
+    Internally stores (task_id, iteration_id, episode_dict) triples up to
+    `capacity` (FIFO eviction).  The iteration_id allows purging episodes
+    collected under a previous potential (which has a different return scale)
+    at the start of each outer iteration.
+
+    sample_batch returns (task_id, episode) pairs — iteration_id is internal.
     """
 
-    def __init__(self, max_episodes: int = 16):
-        self._episodes: deque = deque(maxlen=max_episodes)
+    def __init__(self, capacity: int = 10_000):
+        self.buffer: deque = deque(maxlen=capacity)
 
-    def add(self, ep: dict) -> None:
-        self._episodes.append(ep)
+    def add(self, task_id: int, episode: dict, iteration_id: int = 0) -> None:
+        self.buffer.append((task_id, iteration_id, episode))
+
+    def purge_before(self, iteration_id: int) -> int:
+        """Discard episodes whose iteration_id < iteration_id. Returns count removed."""
+        before = len(self.buffer)
+        self.buffer = deque(
+            ((t, iid, ep) for t, iid, ep in self.buffer if iid >= iteration_id),
+            maxlen=self.buffer.maxlen,
+        )
+        return before - len(self.buffer)
 
     def __len__(self) -> int:
-        return len(self._episodes)
+        return len(self.buffer)
 
-    def get_batch(self) -> dict | None:
-        """Concatenate all stored episodes into a single flat batch."""
-        if not self._episodes:
-            return None
-        keys = ("states_t", "actions_t", "hidden_states_t",
-                "log_probs_old_t", "returns_t")
-        return {k: torch.cat([e[k] for e in self._episodes], dim=0) for k in keys}
+    def sample_batch(
+        self,
+        batch_size: int,
+        current_task: int = None,
+    ) -> list:
+        """Return up to batch_size (task_id, episode) pairs."""
+        if not self.buffer:
+            return []
+        if current_task is not None:
+            task_eps  = [(t, ep) for t, iid, ep in self.buffer if t == current_task]
+            other_eps = [(t, ep) for t, iid, ep in self.buffer if t != current_task]
+            n_current = min(len(task_eps),  batch_size // 2)
+            n_other   = min(len(other_eps), batch_size - n_current)
+            # Reallocate unused slots to the other group
+            n_current = min(len(task_eps),  batch_size - n_other)
+            batch = []
+            if n_current > 0:
+                batch += random.sample(task_eps, n_current)
+            if n_other > 0:
+                batch += random.sample(other_eps, n_other)
+            return batch
+        n = min(len(self.buffer), batch_size)
+        return random.sample([(t, ep) for t, iid, ep in self.buffer], n)
 
 
 # ── Evaluation ─────────────────────────────────────────────────────────────
@@ -111,12 +182,17 @@ def evaluate_meta_policy(
     skeleton_potential       = None,
     shaping_scale: float     = 1.0,
     subgoal_threshold: float = float("inf"),
+    reward_normalizers: dict | None = None,
 ) -> float:
     """Run n_episodes with the meta-policy; return mean success rate.
 
     When meta_subgoals and skeleton_potential are supplied the shaped reward
     is used as the τ signal, matching the training-time GRU input exactly.
-    Success is still measured on raw env reward only.
+    reward_normalizers, if provided, applies the same per-task EMA
+    normalization used during training so the GRU hidden state evolves
+    under the same reward distribution it was trained on.  Stats are NOT
+    updated during eval — only normalize() is called, not update().
+    Success is measured on raw env reward only.
     """
     use_shaping = (meta_subgoals is not None) and (skeleton_potential is not None)
     meta_policy.eval()
@@ -154,6 +230,11 @@ def evaluate_meta_policy(
                 else:
                     r_tau = r_env
 
+                # Apply same normalization as training (read-only — no update)
+                if reward_normalizers is not None and task.id in reward_normalizers:
+                    _r_t  = torch.tensor([r_tau], dtype=torch.float32)
+                    r_tau = float(reward_normalizers[task.id].normalize(_r_t)[0])
+
                 h = meta_policy.update_hidden(s_arr, a_np, r_tau, h)
                 s = s_next
                 t += 1
@@ -174,8 +255,8 @@ def evaluate_meta_policy_per_task(
 ) -> dict:
     """Return {task_id: success_rate} for every task in the distribution.
 
-    Runs exactly n_episodes episodes per task (not sampled randomly) so each
-    task gets a fair, independent evaluation.
+    Runs exactly n_episodes per task so each task gets a fair, independent
+    evaluation.
     """
     meta_policy.eval()
     per_task = {}
@@ -228,6 +309,7 @@ def _collect_episode(
     subgoal_threshold: float,
     max_episode_steps: int,
     device: str,
+    reward_normalizers: dict | None = None,
 ) -> dict | None:
     """
     Roll out one episode for `task` under the current meta_policy with no
@@ -240,8 +322,8 @@ def _collect_episode(
         log_probs_old_t Tensor [T]               — behaviour log-probs (detached)
         returns_t       Tensor [T]               — discounted shaped returns
         shaped_rewards  list[float]
-        env_rewards     list[float]              — raw env rewards for replay buffer
-        transitions     list[(s, a_np, r_env, s_next, done)]
+        env_rewards     list[float]              — raw env rewards
+        transitions     list[(s, a_np, r_env, s_next, done, terminated)]
         task_id         int
     or None if the episode produced no steps.
     """
@@ -280,10 +362,17 @@ def _collect_episode(
             shaping_scale, subgoal_threshold,
         )
 
+        if reward_normalizers is not None:
+            tid = task.id
+            if tid not in reward_normalizers:
+                reward_normalizers[tid] = EMANormalizer()
+            _r_t = torch.tensor([r_shaped], dtype=torch.float32)
+            reward_normalizers[tid].update(_r_t)
+            r_shaped = float(reward_normalizers[tid].normalize(_r_t)[0])
+
         states.append(torch.tensor(s_arr, dtype=torch.float32, device=device))
-        # squeeze(0): [1] → [] (discrete scalar) or [1, ad] → [ad] (continuous)
         actions.append(a.detach().squeeze(0))
-        hidden_states.append(h.detach().squeeze(0))   # [gru_hidden]
+        hidden_states.append(h.detach().squeeze(0))
         log_probs_old.append(lp)
         shaped_rewards.append(r_shaped)
         env_rewards.append(float(r_env))
@@ -300,15 +389,16 @@ def _collect_episode(
 
     returns_list = compute_discounted_returns(shaped_rewards, gamma)
     return {
-        "states_t":        torch.stack(states),
-        "actions_t":       torch.stack(actions),
-        "hidden_states_t": torch.stack(hidden_states),
-        "log_probs_old_t": torch.stack(log_probs_old),
-        "returns_t":       torch.tensor(returns_list, dtype=torch.float32, device=device),
-        "shaped_rewards":  shaped_rewards,
-        "env_rewards":     env_rewards,
-        "transitions":     transitions,
-        "task_id":         task.id,
+        "states_t":         torch.stack(states),
+        "actions_t":        torch.stack(actions),
+        "hidden_states_t":  torch.stack(hidden_states),
+        "shaped_rewards_t": torch.tensor(shaped_rewards, dtype=torch.float32, device=device),
+        "log_probs_old_t":  torch.stack(log_probs_old),
+        "returns_t":        torch.tensor(returns_list, dtype=torch.float32, device=device),
+        "shaped_rewards":   shaped_rewards,
+        "env_rewards":      env_rewards,
+        "transitions":      transitions,
+        "task_id":          task.id,
     }
 
 
@@ -322,14 +412,16 @@ def meta_policy_gradient_with_skeleton_shaping(
     episodes_per_update: int  = 4,
     gamma: float              = 0.99,
     shaping_scale: float      = 1.0,
+    shaping_scales: dict      = None,
     subgoal_threshold: float  = float("inf"),
     entropy_coef: float       = 0.01,
     lr: float                 = 3e-4,
     max_episode_steps: int    = 500,
     eval_every: int           = 50,
     eval_episodes: int        = 10,
-    is_buffer_size: int       = 16,
-    is_clip_epsilon: float    = 0.2,
+    buffer_capacity: int      = 10_000,
+    episodes_per_batch: int   = 40,
+    awr_beta: float           = 1.0,
     replay_buffer             = None,
     flush_buffer: bool        = False,
     flush_optimizer: bool     = False,
@@ -337,53 +429,25 @@ def meta_policy_gradient_with_skeleton_shaping(
     verbose: bool             = True,
     training_state: dict      = None,
     graduation_callback       = None,
-    # ── Smooth shaping ─────────────────────────────────────────────────
-    buffer_warmup_epochs: int  = -1,
-    adaptive_shaping: bool     = True,
-    max_ratio_deviation: float = 0.3,
-    shaping_adapt_rate: float  = 0.5,
 ):
     """
-    Train meta-policy using IS-corrected policy gradient with skeleton-based
-    reward shaping.
+    Train meta-policy using advantage-weighted regression (AWR) with a
+    cross-task replay buffer.
 
-    Episodes are collected under the current behaviour policy (no_grad) and
-    stored in a rolling TrajectoryBuffer of size `is_buffer_size`.  At each
-    gradient step the current policy is re-evaluated via evaluate_actions,
-    the IS ratio ρ = π_θ(a|s,h) / π_old(a|s,h) is computed and clipped to
-    [1−ε, 1+ε] (PPO-style), and the clipped surrogate loss is minimised.
+    buffer_capacity   — max episodes stored across all tasks (FIFO eviction).
+    episodes_per_batch — episodes sampled per gradient step; half come from the
+                         task most recently collected, half from other tasks.
+                         Set to 40–80 for 20–40 episodes per task per update.
 
-    Smooth-shaping parameters
-    ─────────────────────────
-    buffer_warmup_epochs (-1 = auto)
-        Epochs at the start during which episodes are collected but NO gradient
-        update is applied.  Auto sets this to ceil(is_buffer_size/episodes_per_update)
-        so the first gradient step always operates on a full IS buffer, removing
-        the noisy-first-update jump.
-
-    adaptive_shaping (default True)
-        Tracks an EMA of |mean(IS-ratio) − 1| after each gradient step.  When
-        the EMA exceeds max_ratio_deviation the effective shaping scale is
-        reduced toward shaping_adapt_rate × shaping_scale (floor).  If the
-        scale change is >10% the IS buffer is flushed so stale returns (computed
-        under the old scale) are discarded before the next update.
-
-    training_state carries {meta_value_net, policy_optimizer, value_optimizer,
-    is_buffer, ema_ratio_dev, effective_shaping} across iterations.  On
-    flush_buffer=True (new iteration) the EMA and effective_shaping are reset
-    to 0 / shaping_scale so each iteration starts fresh.
+    The MetaPolicyBuffer persists across outer iterations (flush_buffer only
+    resets the value-optimizer state).  Advantage weighting naturally
+    down-weights stale low-return episodes, so old data does not harm training.
     """
     meta_subgoals      = skeleton_data.get("meta_subgoals")
     skeleton_potential = skeleton_data.get("skeleton_potential")
 
     n_tasks             = len(task_distribution.tasks)
     episodes_per_update = max(1, min(episodes_per_update, n_tasks))
-
-    # Auto warmup: fill the IS buffer completely before the first gradient step.
-    if buffer_warmup_epochs < 0:
-        buffer_warmup_epochs = max(
-            0, -(-is_buffer_size // episodes_per_update)  # ceil division
-        )
 
     state_dim = meta_policy.state_dim
     ts        = training_state or {}
@@ -397,28 +461,49 @@ def meta_policy_gradient_with_skeleton_shaping(
     value_optimizer  = (ts.get("value_optimizer") or
                         torch.optim.Adam(meta_value_net.parameters(), lr=lr))
 
-    is_buffer = (ts.get("is_buffer") or
-                 TrajectoryBuffer(max_episodes=is_buffer_size))
+    # Buffer persists across iterations — old episodes are reused under AWR.
+    meta_policy_buffer = (ts.get("meta_policy_buffer") or
+                          MetaPolicyBuffer(capacity=buffer_capacity))
 
-    # Return normalizer persists across iterations — intentionally not reset on
-    # flush so the running stats track the full lifetime scale of returns.
-    returns_normalizer = ts.get("returns_normalizer") or RunningMeanStd()
+    # Iteration counter tags every episode so stale-potential data can be purged.
+    iteration_id = ts.get("iteration_id", 0)
 
-    # Adaptive-shaping state: reset on each flush (new potential = new iteration).
+    # Per-task return normalizers — one RunningMeanStd per task_id.
+    # Keeping them separate prevents a task with large raw rewards (e.g.
+    # HumanoidStandup at ~50 000/ep) from dominating the shared statistics and
+    # zeroing the advantage signal for tasks with small rewards (e.g. Humanoid
+    # at ~100/ep).  Each task's returns are independently centred and scaled to
+    # unit std before advantages are computed, so every task contributes a
+    # meaningful gradient regardless of its absolute reward magnitude.
+    # Reset on flush_buffer for the same reason as before: a new potential
+    # changes return scale, so stale statistics would anchor the normalizer.
+    returns_normalizers: dict = {} if flush_buffer else (
+        ts.get("returns_normalizers") or {}
+    )
+    reward_normalizers: dict = {} if flush_buffer else (
+        ts.get("reward_normalizers") or {}
+    )
+
+    # Per-task EMA of mean episode env return — used to weight AWR gradients
+    # by inverse task difficulty so struggling tasks receive more signal.
+    # Persists across outer iterations (EMA is self-decaying so stale values
+    # fade naturally; no need to reset on flush_buffer).
+    task_ema_env_returns: dict = ts.get("task_ema_env_returns") or {}
+    _ema_alpha_task: float = 0.9   # slow-moving so weights don't thrash
+
+    # New iteration: increment the tag, purge episodes from previous iterations
+    # (their shaped rewards reflect a stale potential with a different scale),
+    # and reset value-optimizer momentum.
     if flush_buffer:
-        is_buffer = TrajectoryBuffer(max_episodes=is_buffer_size)
+        iteration_id += 1
+        n_purged = meta_policy_buffer.purge_before(iteration_id)
         value_optimizer.state.clear()
-        ema_ratio_dev    = 0.0
-        effective_shaping = shaping_scale
-    else:
-        ema_ratio_dev    = float(ts.get("ema_ratio_dev",    0.0))
-        effective_shaping = float(ts.get("effective_shaping", shaping_scale))
+        if verbose and n_purged:
+            print(f"  [PG] Purged {n_purged} stale-potential episodes from buffer.")
 
     if flush_optimizer:
         policy_optimizer.state.clear()
         value_optimizer.state.clear()
-
-    _ema_alpha = 0.15   # EMA smoothing for IS ratio deviation
 
     epoch_losses: list = []
     meta_policy.train()
@@ -429,47 +514,42 @@ def meta_policy_gradient_with_skeleton_shaping(
 
     for epoch in range(meta_epochs):
 
-        # ── Adaptive shaping: adjust effective_shaping before this collection ─
-        if adaptive_shaping and epoch > 0:
-            # shaping_factor ∈ [shaping_adapt_rate, 1.0]: decreases when IS
-            # ratios indicate the policy has drifted far from behaviour.
-            excess = max(0.0, ema_ratio_dev - max_ratio_deviation)
-            shaping_factor = max(shaping_adapt_rate, 1.0 - excess)
-            new_effective  = shaping_scale * shaping_factor
-
-            # If scale would shift by >10% the buffered returns are stale —
-            # flush before collecting at the new scale.
-            if effective_shaping > 1e-8:
-                change_frac = abs(new_effective - effective_shaping) / effective_shaping
-            else:
-                change_frac = 1.0
-            if change_frac > 0.10:
-                is_buffer = TrajectoryBuffer(max_episodes=is_buffer_size)
-                value_optimizer.state.clear()
-                if verbose:
-                    print(f"  [PG] epoch {epoch}: adaptive flush  "
-                          f"scale {effective_shaping:.3f}→{new_effective:.3f}  "
-                          f"ema_ratio_dev={ema_ratio_dev:.3f}")
-                effective_shaping = new_effective
-
         # ── Collect fresh episodes (behaviour policy, no gradients) ──────────
-        fresh_rewards: list = []
+        fresh_rewards:     list = []
+        fresh_env_rewards: list = []   # raw env reward, unaffected by shaping scale
 
         for _ in range(episodes_per_update):
             task = task_list[task_cursor % n_tasks]
             task_cursor += 1
 
+            task_shaping_scale = (
+                shaping_scales.get(task.id, shaping_scale)
+                if shaping_scales else shaping_scale
+            )
             ep = _collect_episode(
                 meta_policy, task,
                 meta_subgoals, skeleton_potential,
-                gamma, effective_shaping, subgoal_threshold,
+                gamma, task_shaping_scale, subgoal_threshold,
                 max_episode_steps, device,
+                reward_normalizers=reward_normalizers,
             )
             if ep is None:
                 continue
 
-            is_buffer.add(ep)
+            meta_policy_buffer.add(task.id, ep, iteration_id)
             fresh_rewards.extend(ep["shaped_rewards"])
+            fresh_env_rewards.extend(ep["env_rewards"])
+
+            # Update per-task EMA return for difficulty-weighted gradients
+            ep_env_r = float(np.mean(ep["env_rewards"])) if ep["env_rewards"] else 0.0
+            tid = task.id
+            if tid not in task_ema_env_returns:
+                task_ema_env_returns[tid] = ep_env_r
+            else:
+                task_ema_env_returns[tid] = (
+                    _ema_alpha_task * task_ema_env_returns[tid]
+                    + (1.0 - _ema_alpha_task) * ep_env_r
+                )
 
             if replay_buffer is not None:
                 for s_arr, a_np, r_env, s_next_arr, done, terminated in ep["transitions"]:
@@ -478,64 +558,131 @@ def meta_policy_gradient_with_skeleton_shaping(
                         terminated=terminated,
                     )
 
-        # ── Warmup: skip gradient until IS buffer is full ─────────────────────
-        if epoch < buffer_warmup_epochs:
+        # ── Wait for enough data for a meaningful batch ───────────────────────
+        if len(meta_policy_buffer) < max(1, episodes_per_batch // 2):
             continue
 
-        # ── Gradient update using full IS buffer ──────────────────────────────
-        batch = is_buffer.get_batch()
-        if batch is None:
+        # ── Compute per-task gradient weights from inverse difficulty ─────────
+        # Tasks with lower EMA env returns are harder; weight them more so
+        # the meta-policy receives equal gradient signal regardless of whether
+        # one task dominates by absolute reward magnitude.
+        # Weights are normalized to mean=1.0 so the total gradient scale is
+        # unchanged — we're redistributing signal, not scaling it.
+        if len(task_ema_env_returns) == n_tasks:
+            _raw_w = {tid: 1.0 / max(abs(r), 1.0)
+                      for tid, r in task_ema_env_returns.items()}
+            _w_mean = float(np.mean(list(_raw_w.values())))
+            task_gradient_weights = {tid: w / max(_w_mean, 1e-8)
+                                     for tid, w in _raw_w.items()}
+        else:
+            task_gradient_weights = {}
+
+        # ── One gradient step per task (consistent gradient target per step) ──
+        # Each task samples its own batch: 50% episodes from that task, 50%
+        # from other tasks. This keeps the gradient direction fixed within each
+        # step rather than rotating with the round-robin collector.
+        epoch_task_losses: list = []
+        n_zero_adv = 0  # tasks whose batch had near-zero advantage variance
+
+        for task in task_list:
+            batch = meta_policy_buffer.sample_batch(episodes_per_batch, task.id)
+            if not batch:
+                continue
+            n_eps = len(batch)
+
+            # Pass 1 (no grad): collect raw advantages for batch normalisation.
+            all_returns_norm: list = []
+            all_raw_adv:      list = []
+
+            with torch.no_grad():
+                for _tid, ep in batch:
+                    if _tid not in returns_normalizers:
+                        returns_normalizers[_tid] = RunningMeanStd()
+                    returns_normalizers[_tid].update(ep["returns_t"])
+                    ret_norm = returns_normalizers[_tid].normalize(ep["returns_t"])
+                    vals = meta_value_net(
+                        ep["states_t"],
+                        ep["hidden_states_t"].to(device),
+                    ).squeeze(-1)
+                    all_returns_norm.append(ret_norm)
+                    all_raw_adv.append(ret_norm - vals)
+
+            all_adv_cat = torch.cat(all_raw_adv)
+            adv_mean    = all_adv_cat.mean()
+            adv_std     = all_adv_cat.std()
+            if adv_std <= 1e-6:
+                n_zero_adv += 1
+
+            # Pass 2 (with grad): re-roll GRU and apply batch-normalised AWR update.
+            policy_optimizer.zero_grad()
+            value_optimizer.zero_grad()
+
+            ep_policy_losses: list = []
+            ep_value_losses:  list = []
+            ep_ent_losses:    list = []
+
+            for i, (_tid, ep) in enumerate(batch):
+                curr_lp, curr_ent, ctx = meta_policy.evaluate_actions_gru(
+                    ep["states_t"], ep["actions_t"], ep["shaped_rewards_t"]
+                )
+
+                returns_norm = all_returns_norm[i]
+
+                raw_adv = all_raw_adv[i]
+                if adv_std > 1e-6:
+                    advantages = (raw_adv - adv_mean) / (adv_std + 1e-8)
+                else:
+                    advantages = raw_adv
+
+                awr_weight = (advantages / awr_beta).clamp(-5.0, 2.0).exp().detach()
+
+                values = meta_value_net(
+                    ep["states_t"], ctx.detach()
+                ).squeeze(-1)
+
+                policy_loss   = -(awr_weight * curr_lp).mean()
+                value_loss    = F.mse_loss(values, returns_norm)
+                entropy_bonus = curr_ent.mean()
+
+                task_w = task_gradient_weights.get(task.id, 1.0)
+                total_ep_loss = (
+                    policy_loss + 0.5 * value_loss - entropy_coef * entropy_bonus
+                ) * task_w
+                total_ep_loss.div(n_eps).backward()
+
+                ep_policy_losses.append(policy_loss.item())
+                ep_value_losses.append(value_loss.item())
+                ep_ent_losses.append(entropy_bonus.item())
+
+            torch.nn.utils.clip_grad_norm_(meta_policy.parameters(),    0.5)
+            torch.nn.utils.clip_grad_norm_(meta_value_net.parameters(), 0.5)
+            policy_optimizer.step()
+            value_optimizer.step()
+
+            epoch_task_losses.append({
+                "policy":  float(np.mean(ep_policy_losses)),
+                "value":   float(np.mean(ep_value_losses)),
+                "entropy": float(np.mean(ep_ent_losses)),
+            })
+
+        if not epoch_task_losses:
             continue
 
-        curr_lp, curr_ent = meta_policy.evaluate_actions(
-            batch["states_t"], batch["actions_t"], batch["hidden_states_t"]
-        )
-
-        # Normalize returns: update running stats then map to ~N(0,1) scale.
-        # Value network learns to predict normalized targets; advantages are
-        # computed in the same space, keeping loss magnitude scale-invariant.
-        returns_normalizer.update(batch["returns_t"])
-        returns_norm = returns_normalizer.normalize(batch["returns_t"])
-
-        values = meta_value_net(
-            batch["states_t"], batch["hidden_states_t"]
-        ).squeeze(-1)
-        adv = returns_norm - values.detach()
-        adv_std = adv.std()
-        if adv_std > 1e-6:
-            adv = (adv - adv.mean()) / (adv_std + 1e-8)
-
-        log_ratio     = curr_lp - batch["log_probs_old_t"].detach()
-        ratio         = log_ratio.exp()
-        ratio_clipped = ratio.clamp(1.0 - is_clip_epsilon, 1.0 + is_clip_epsilon)
-
-        policy_loss  = -torch.min(ratio * adv, ratio_clipped * adv).mean()
-        value_loss   = F.mse_loss(values, returns_norm)
-        entropy_loss = curr_ent.mean()
+        policy_loss  = float(np.mean([x["policy"]  for x in epoch_task_losses]))
+        value_loss   = float(np.mean([x["value"]   for x in epoch_task_losses]))
+        entropy_loss = float(np.mean([x["entropy"] for x in epoch_task_losses]))
         total_loss   = policy_loss + 0.5 * value_loss - entropy_coef * entropy_loss
+        # Fraction of per-task gradient steps where adv_std ≤ 1e-6 (gradient silenced).
+        zero_adv_frac = n_zero_adv / max(1, n_tasks)
 
-        value_optimizer.zero_grad()
-        (0.5 * value_loss).backward()
-        torch.nn.utils.clip_grad_norm_(meta_value_net.parameters(), 1.0)
-        value_optimizer.step()
-
-        policy_optimizer.zero_grad()
-        (policy_loss - entropy_coef * entropy_loss).backward()
-        torch.nn.utils.clip_grad_norm_(meta_policy.parameters(), 1.0)
-        policy_optimizer.step()
-
-        # Update EMA of IS ratio deviation for next epoch's adaptive shaping.
-        with torch.no_grad():
-            ratio_dev_t = (ratio.mean() - 1.0).abs().item()
-        ema_ratio_dev = (1.0 - _ema_alpha) * ema_ratio_dev + _ema_alpha * ratio_dev_t
-
+        avg_env_r = float(np.mean(fresh_env_rewards)) if fresh_env_rewards else 0.0
         epoch_losses.append({
-            "total":            float(total_loss.item()),
-            "policy":           float(policy_loss.item()),
-            "value":            float(value_loss.item()),
-            "entropy":          float(entropy_loss.item()),
-            "effective_shaping": float(effective_shaping),
-            "ema_ratio_dev":    float(ema_ratio_dev),
+            "total":         total_loss,
+            "policy":        policy_loss,
+            "value":         value_loss,
+            "entropy":       entropy_loss,
+            "zero_adv_frac": zero_adv_frac,
+            "avg_env_r":     avg_env_r,
         })
 
         if (epoch + 1) % eval_every == 0:
@@ -546,19 +693,16 @@ def meta_policy_gradient_with_skeleton_shaping(
                 skeleton_potential=skeleton_potential,
                 shaping_scale=shaping_scale,
                 subgoal_threshold=subgoal_threshold,
+                reward_normalizers=reward_normalizers,
             )
             if verbose:
-                avg_r      = float(np.mean(fresh_rewards)) if fresh_rewards else 0.0
-                mean_ratio = float(ratio.mean().item())
-                n_buf      = len(is_buffer)
+                avg_shaped_r = float(np.mean(fresh_rewards)) if fresh_rewards else 0.0
                 print(f"  [PG] epoch {epoch+1}/{meta_epochs}  "
-                      f"buf={n_buf}ep  "
-                      f"scale={effective_shaping:.3f}  "
-                      f"IS_ratio={mean_ratio:.3f}  ema_dev={ema_ratio_dev:.3f}  "
-                      f"loss={total_loss.item():.4f}  "
-                      f"avg_r={avg_r:.4f}  sr={sr:.1%}")
+                      f"buf={len(meta_policy_buffer)}ep  tasks={n_tasks}  "
+                      f"loss={total_loss:.4f}  "
+                      f"avg_env_r={avg_env_r:.2f}  avg_shaped_r={avg_shaped_r:.4f}  "
+                      f"sr={sr:.1%}  zero_adv={zero_adv_frac:.0%}")
 
-            # Per-task graduation check
             per_task_sr = evaluate_meta_policy_per_task(
                 meta_policy, task_distribution,
                 n_episodes=eval_episodes, device=device,
@@ -570,19 +714,19 @@ def meta_policy_gradient_with_skeleton_shaping(
             if newly_graduated:
                 if graduation_callback is not None:
                     graduation_callback(newly_graduated)
-                # Refresh round-robin list after task_distribution may have changed
-                task_list = list(task_distribution.tasks)
-                n_tasks   = len(task_list)
+                task_list   = list(task_distribution.tasks)
+                n_tasks     = len(task_list)
                 task_cursor = 0
                 if n_tasks == 0:
                     break
 
     return meta_policy, meta_value_net, epoch_losses, {
-        "meta_value_net":      meta_value_net,
-        "policy_optimizer":    policy_optimizer,
-        "value_optimizer":     value_optimizer,
-        "is_buffer":           is_buffer,
-        "ema_ratio_dev":       ema_ratio_dev,
-        "effective_shaping":   effective_shaping,
-        "returns_normalizer":  returns_normalizer,
+        "meta_value_net":        meta_value_net,
+        "policy_optimizer":      policy_optimizer,
+        "value_optimizer":       value_optimizer,
+        "meta_policy_buffer":    meta_policy_buffer,
+        "returns_normalizers":   returns_normalizers,
+        "reward_normalizers":    reward_normalizers,
+        "task_ema_env_returns":  task_ema_env_returns,
+        "iteration_id":          iteration_id,
     }
